@@ -13,12 +13,14 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.db.models import File
-from app.services.chunker import process_pdf_with_smart_ocr, process_text_into_chunks
-from app.services.ocr_worker import extract_text_from_pdf  # OCR fallback
+from app.services.chunker import (
+    process_any_file,
+    process_text_into_chunks
+)
+from app.services.parser import extract_text_from_file
 from app.services.retrieval import get_file_docs_for_qualifier
 from app.services.agents.ai_qualifier import qualify_documents
 from app.services.validation.verifier import run_full_verification
-from app.services.parser import extract_text_from_file
 from app.utils.config import settings
 
 # ============================================================
@@ -35,10 +37,70 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def _extract_case_id_from_name(name: str) -> Optional[str]:
+    """
+    Пытается извлечь номер ЕРДР / дела из ИМЕНИ файла / архива.
+    Ищем 15 подряд идущих цифр.
+    """
     if not name:
         return None
     m = re.search(r"(\d{15})", name)
     return m.group(1) if m else None
+
+
+def _extract_case_id_from_text(text: str) -> Optional[str]:
+    """
+    Пытается извлечь номер ЕРДР / дела из ТЕКСТА документа.
+    Работает и для текстовых PDF, и для DOCX/TXT, и для результатов OCR.
+    """
+    if not text:
+        return None
+    # Ищем любую последовательность из 15 цифр
+    m = re.search(r"(\d{15})", text)
+    return m.group(1) if m else None
+
+
+def _detect_case_id_for_file(
+    file_path: str,
+    filename: str,
+    outer_case_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Универсальный детектор номера дела для одного файла.
+
+    Порядок:
+    1) ищем в названии файла;
+    2) если не нашли — пытаемся вытащить текст (PDF/DOCX/TXT) и найти там;
+    3) если не нашли — используем outer_case_id (для файлов внутри ZIP).
+    """
+    # 1) По имени файла
+    case_id = _extract_case_id_from_name(filename)
+    if case_id:
+        logger.info(f"🔎 case_id={case_id} найден в названии файла: {filename}")
+        return case_id
+
+    # 2) По тексту файла
+    try:
+        text = extract_text_from_file(file_path) or ""
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось извлечь текст из файла {filename} для поиска case_id: {e}")
+        text = ""
+
+    if text.strip():
+        case_id_from_text = _extract_case_id_from_text(text)
+        if case_id_from_text:
+            logger.info(f"🔎 case_id={case_id_from_text} найден в тексте файла: {filename}")
+            return case_id_from_text
+
+    # 3) Fallback — берем case_id снаружи (например, из имени ZIP)
+    if outer_case_id:
+        logger.info(
+            f"ℹ️ Для файла {filename} используем outer_case_id={outer_case_id} "
+            f"(по имени/тексту не найдено)"
+        )
+        return outer_case_id
+
+    logger.info(f"⚠️ case_id не найден ни в имени, ни в тексте файла: {filename}")
+    return None
 
 
 def _validate_file_size(file: UploadFile) -> None:
@@ -46,9 +108,12 @@ def _validate_file_size(file: UploadFile) -> None:
         if file.size > MAX_FILE_SIZE_BYTES:
             raise HTTPException(
                 status_code=413,
-                detail=f"Файл {file.filename} слишком большой ({file.size / 1024 / 1024:.1f} МБ). "
-                       f"Максимальный размер: {MAX_FILE_SIZE_MB} МБ"
+                detail=(
+                    f"Файл {file.filename} слишком большой ({file.size / 1024 / 1024:.1f} МБ). "
+                    f"Максимальный размер: {MAX_FILE_SIZE_MB} МБ"
+                )
             )
+
 
 # ============================================================
 # Основной endpoint
@@ -59,29 +124,29 @@ async def upload_files(
     files: List[UploadFile] = FastAPIFile(...),
     db: Session = Depends(get_db),
 ):
-    results: List[dict] = []
-    case_ids_map: dict = {}
+    results = []
+    case_ids_map = {}
 
-    logger.info(f"📤 Начало загрузки {len(files)} файлов")
+    logger.info(f"📤 Загружается файлов: {len(files)}")
 
     for file in files:
         temp_path = None
+
         try:
-            # 1️⃣ Проверка размера
+            # 1) Проверка размера
             try:
                 _validate_file_size(file)
             except HTTPException as e:
-                logger.warning(f"⚠️ {e.detail}")
                 results.append({
                     "file_id": None,
                     "filename": file.filename,
                     "chunks_created": 0,
                     "error": e.detail,
-                    "status": "failed"
+                    "status": "failed",
                 })
                 continue
 
-            # 2️⃣ Временное сохранение файла
+            # 2) Временное сохранение файла
             with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as tmp:
                 temp_path = tmp.name
                 content = await file.read()
@@ -92,41 +157,49 @@ async def upload_files(
                     )
                 tmp.write(content)
 
-            logger.info(f"📥 Загружен файл: {file.filename} ({len(content) / 1024:.1f} КБ)")
             ext = os.path.splitext(file.filename)[1].lower()
+            logger.info(f"📥 Загружен {file.filename}, размер {len(content)} байт")
 
             # ============================================================
-            # 3️⃣ ZIP
+            # 3) ZIP
             # ============================================================
             if ext == ".zip":
                 extract_dir = tempfile.mkdtemp(prefix="unzipped_")
                 try:
                     with zipfile.ZipFile(temp_path, "r") as zip_ref:
                         zip_ref.extractall(extract_dir)
-                    logger.info(f"📦 Распакован архив {file.filename} → {extract_dir}")
                 except zipfile.BadZipFile:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Файл {file.filename} повреждён или не является ZIP архивом"
-                    )
+                    raise HTTPException(status_code=400, detail="ZIP файл повреждён")
 
+                # case_id, который удалось найти в ИМЕНИ самого ZIP
                 outer_case_id = _extract_case_id_from_name(file.filename)
-                zip_inner_ids: List[str] = []
+                if outer_case_id:
+                    logger.info(f"🔎 outer_case_id={outer_case_id} найден в имени ZIP {file.filename}")
+                else:
+                    logger.info(f"ℹ️ В имени ZIP {file.filename} номер дела не найден")
+
+                zip_inner_ids = []
 
                 for root, _, inner_files in os.walk(extract_dir):
                     for inner_name in inner_files:
                         inner_path = os.path.join(root, inner_name)
                         inner_ext = os.path.splitext(inner_name)[1].lower()
                         if inner_ext not in [".pdf", ".docx", ".txt"]:
-                            logger.debug(f"⏭️ Пропуск файла: {inner_name}")
                             continue
 
                         inner_file_id = uuid.uuid4()
-                        chunks_created = 0
                         with db.begin_nested():
                             try:
-                                detected_case = _extract_case_id_from_name(inner_name)
-                                case_id_to_save = detected_case or outer_case_id
+                                # 🔥 Новый умный поиск case_id:
+                                # 1) имя внутреннего файла
+                                # 2) текст/ОCR внутреннего файла
+                                # 3) outer_case_id (из имени ZIP)
+                                case_id_to_save = _detect_case_id_for_file(
+                                    file_path=inner_path,
+                                    filename=inner_name,
+                                    outer_case_id=outer_case_id,
+                                )
+
                                 new_file = File(
                                     file_id=inner_file_id,
                                     filename=inner_name,
@@ -137,18 +210,17 @@ async def upload_files(
                                 db.add(new_file)
                                 db.flush()
 
+                                chunks_created = 0
                                 if inner_ext == ".pdf":
-                                    chunks_created = process_pdf_with_smart_ocr(inner_path, inner_file_id, db)
+                                    # 🔁 Логика чанкинга не меняется
+                                    chunks_created = process_any_file(inner_path, inner_file_id, db)
                                 else:
                                     text = extract_text_from_file(inner_path) or ""
-                                    if not text.strip():
-                                        raise ValueError("Пустой текст")
-                                    chunks_created = process_text_into_chunks(inner_file_id, text, db)
+                                    if text.strip():
+                                        chunks_created = process_text_into_chunks(inner_file_id, text, db)
 
-                                if hasattr(new_file, "chunks_count"):
-                                    new_file.chunks_count = chunks_created
-
-                                logger.info(f"✅ {inner_name}: {chunks_created} чанков")
+                                new_file.chunks_count = chunks_created
+                                logger.info(f"📄 {inner_name}: создано чанков = {chunks_created}")
 
                                 if case_id_to_save:
                                     case_ids_map.setdefault(case_id_to_save, []).append(str(inner_file_id))
@@ -157,199 +229,194 @@ async def upload_files(
                                     "file_id": str(inner_file_id),
                                     "filename": inner_name,
                                     "chunks_created": chunks_created,
-                                    "s3_key": f"s3://afm-originals/{inner_name}",
                                     "case_id": case_id_to_save,
-                                    "status": "success"
+                                    "s3_key": f"s3://afm-originals/{inner_name}",
+                                    "status": "success",
                                 })
+
                                 zip_inner_ids.append(str(inner_file_id))
-                            except ValueError as ve:
-                                db.rollback()
-                                logger.debug(f"⏭️ {inner_name} пропущен: {ve}")
+
                             except Exception as e:
-                                db.rollback()
-                                err = f"Ошибка обработки {inner_name}: {str(e)}"
-                                logger.error(f"❌ {err}")
+                                logger.error(f"❌ Ошибка файла в ZIP {inner_name}: {e}")
                                 results.append({
                                     "file_id": str(inner_file_id),
                                     "filename": inner_name,
                                     "chunks_created": 0,
-                                    "error": err,
+                                    "error": str(e),
                                     "status": "failed"
                                 })
 
-                # итог по ZIP
-                try:
-                    zip_chunks_total = sum(
-                        r.get("chunks_created", 0)
-                        for r in results if r.get("file_id") in zip_inner_ids
-                    )
-                    results.append({
-                        "file_id": None,
-                        "filename": file.filename,
-                        "type": "zip_summary",
-                        "chunks_created": zip_chunks_total,
-                        "files_processed": len(zip_inner_ids),
-                        "case_id": outer_case_id,
-                        "status": "success"
-                    })
-                except Exception as e:
-                    logger.error(f"❌ Ошибка агрегации ZIP {file.filename}: {e}")
-                finally:
-                    shutil.rmtree(extract_dir, ignore_errors=True)
+                # Итог по ZIP
+                total_chunks = sum(
+                    r.get("chunks_created", 0)
+                    for r in results
+                    if r.get("file_id") in zip_inner_ids
+                )
+                results.append({
+                    "file_id": None,
+                    "filename": file.filename,
+                    "type": "zip_summary",
+                    "files_processed": len(zip_inner_ids),
+                    "chunks_created": total_chunks,
+                    "case_id": outer_case_id,
+                    "status": "success"
+                })
 
+                shutil.rmtree(extract_dir, ignore_errors=True)
                 continue
 
             # ============================================================
-            # 4️⃣ PDF
+            # 4) PDF
             # ============================================================
             if ext == ".pdf":
                 file_id = uuid.uuid4()
-                chunks_created = 0
                 with db.begin_nested():
                     try:
-                        single_case_id = _extract_case_id_from_name(file.filename)
+                        # 🔥 Здесь теперь умный поиск case_id:
+                        case_id_extracted = _detect_case_id_for_file(
+                            file_path=temp_path,
+                            filename=file.filename,
+                            outer_case_id=None,
+                        )
+
                         new_file = File(
                             file_id=file_id,
                             filename=file.filename,
-                            case_id=single_case_id,
+                            case_id=case_id_extracted,
                             s3_key=f"s3://afm-originals/{file.filename}",
                             ocr_confidence=0.9,
                         )
                         db.add(new_file)
                         db.flush()
-                        chunks_created = process_pdf_with_smart_ocr(temp_path, file_id, db)
-                        if hasattr(new_file, "chunks_count"):
-                            new_file.chunks_count = chunks_created
-                        logger.info(f"✅ PDF {file.filename}: {chunks_created} чанков")
 
-                        if single_case_id:
-                            case_ids_map.setdefault(single_case_id, []).append(str(file_id))
+                        # Логика чанкинга не меняется
+                        chunks_created = process_any_file(temp_path, file_id, db)
+                        new_file.chunks_count = chunks_created
+                        logger.info(f"📄 PDF {file.filename}: чанков = {chunks_created}")
+
+                        if case_id_extracted:
+                            case_ids_map.setdefault(case_id_extracted, []).append(str(file_id))
 
                         results.append({
                             "file_id": str(file_id),
                             "filename": file.filename,
                             "chunks_created": chunks_created,
+                            "case_id": case_id_extracted,
                             "s3_key": f"s3://afm-originals/{file.filename}",
-                            "case_id": single_case_id,
-                            "status": "success"
+                            "status": "success",
                         })
+
                     except Exception as e:
-                        db.rollback()
-                        err = f"Ошибка обработки PDF {file.filename}: {str(e)}"
-                        logger.error(f"❌ {err}")
+                        logger.error(f"❌ Ошибка PDF {file.filename}: {e}")
                         results.append({
                             "file_id": str(file_id),
                             "filename": file.filename,
                             "chunks_created": 0,
-                            "error": err,
-                            "status": "failed"
+                            "error": str(e),
+                            "status": "failed",
                         })
                 continue
 
             # ============================================================
-            # 5️⃣ DOCX/TXT
+            # 5) DOCX / TXT
             # ============================================================
             if ext in [".docx", ".txt"]:
                 file_id = uuid.uuid4()
-                chunks_created = 0
                 with db.begin_nested():
                     try:
-                        single_case_id = _extract_case_id_from_name(file.filename)
+                        # 🔥 Аналогично ищем case_id и по имени, и по тексту
+                        case_id_extracted = _detect_case_id_for_file(
+                            file_path=temp_path,
+                            filename=file.filename,
+                            outer_case_id=None,
+                        )
+
                         new_file = File(
                             file_id=file_id,
                             filename=file.filename,
-                            case_id=single_case_id,
+                            case_id=case_id_extracted,
                             s3_key=f"s3://afm-originals/{file.filename}",
                             ocr_confidence=0.95,
                         )
                         db.add(new_file)
                         db.flush()
+
                         text = extract_text_from_file(temp_path) or ""
                         if not text.strip():
                             raise ValueError("Пустой текст")
-                        chunks_created = process_text_into_chunks(file_id, text, db)
-                        if hasattr(new_file, "chunks_count"):
-                            new_file.chunks_count = chunks_created
-                        logger.info(f"✅ {ext.upper()} {file.filename}: {chunks_created} чанков")
 
-                        if single_case_id:
-                            case_ids_map.setdefault(single_case_id, []).append(str(file_id))
+                        chunks_created = process_text_into_chunks(file_id, text, db)
+                        new_file.chunks_count = chunks_created
+
+                        if case_id_extracted:
+                            case_ids_map.setdefault(case_id_extracted, []).append(str(file_id))
 
                         results.append({
                             "file_id": str(file_id),
                             "filename": file.filename,
                             "chunks_created": chunks_created,
-                            "s3_key": f"s3://afm-originals/{file.filename}",
-                            "case_id": single_case_id,
-                            "status": "success"
+                            "case_id": case_id_extracted,
+                            "status": "success",
                         })
-                    except ValueError as ve:
-                        db.rollback()
-                        logger.debug(f"⏭️ {file.filename} пропущен: {ve}")
+
                     except Exception as e:
-                        db.rollback()
-                        err = f"Ошибка обработки {file.filename}: {str(e)}"
-                        logger.error(f"❌ {err}")
+                        logger.error(f"❌ Ошибка обработки {file.filename}: {e}")
                         results.append({
                             "file_id": str(file_id),
                             "filename": file.filename,
                             "chunks_created": 0,
-                            "error": err,
-                            "status": "failed"
+                            "error": str(e),
+                            "status": "failed",
                         })
                 continue
 
             # ============================================================
-            # 6️⃣ Неподдерживаемый формат
+            # 6) Неподдерживаемый формат
             # ============================================================
-            logger.warning(f"⛔ Неподдерживаемый формат: {ext}")
             results.append({
                 "file_id": None,
                 "filename": file.filename,
                 "chunks_created": 0,
                 "error": f"Неподдерживаемый формат: {ext}",
-                "status": "failed"
+                "status": "failed",
             })
 
-        except HTTPException:
-            raise
         except Exception as e:
-            err = f"Критическая ошибка загрузки {file.filename}: {str(e)}"
-            logger.error(f"❌ {err}", exc_info=True)
+            logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
             results.append({
                 "file_id": None,
                 "filename": file.filename,
+                "error": str(e),
                 "chunks_created": 0,
-                "error": err,
-                "status": "failed"
+                "status": "failed",
             })
+
         finally:
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
-                    logger.debug(f"🧹 Удалён временный файл: {temp_path}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось удалить {temp_path}: {e}")
+                except Exception:
+                    pass
 
-    # ✅ Единый общий коммит после всех файлов
+    # ============================================================
+    # Глобальный коммит
+    # ============================================================
     try:
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"❌ Ошибка финального коммита: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка общего коммита: {e}")
 
     # ============================================================
-    # 7️⃣ Квалификация
+    # 7) Квалификация (логика не меняется)
     # ============================================================
     qualification_results = []
+
     if case_ids_map:
-        logger.info(f"🤖 Запуск квалификации для {len(case_ids_map)} дел")
         for case_id, file_ids in case_ids_map.items():
             try:
-                logger.info(f"📋 Квалификация дела {case_id} ({len(file_ids)} файлов)")
                 docs = get_file_docs_for_qualifier(db, file_ids=file_ids, case_id=case_id)
                 if not docs:
-                    logger.warning(f"⚠️ Нет документов для дела {case_id}")
                     continue
 
                 qualifier = qualify_documents(
@@ -358,34 +425,31 @@ async def upload_files(
                     city="г. Павлодар",
                     investigator_line="Следователь СЭР ДЭР по Павлодарской области",
                 )
+
                 verification = run_full_verification(qualifier)
+
                 qualification_results.append({
                     "case_id": case_id,
                     "files_analyzed": len(file_ids),
                     "qualifier": qualifier,
                     "verification": verification,
-                    "draft_postanovlenie": qualifier.get("final_postanovlenie")
-                        if isinstance(qualifier, dict) else None,
-                    "status": "success"
+                    "draft_postanovlenie": qualifier.get("final_postanovlenie"),
+                    "status": "success",
                 })
-                logger.info(f"✅ Квалификация {case_id} завершена: {qualifier.get('verdict', 'N/A')}")
+
             except Exception as e:
-                err = f"Ошибка квалификации дела {case_id}: {str(e)}"
-                logger.error(f"❌ {err}")
                 qualification_results.append({
                     "case_id": case_id,
                     "files_analyzed": len(file_ids),
-                    "error": err,
-                    "status": "failed"
+                    "error": str(e),
+                    "status": "failed",
                 })
 
     # ============================================================
-    # 8️⃣ Финальный ответ
+    # 8) Финальный ответ
     # ============================================================
-    successful_files = sum(1 for r in results if r.get("status") == "success")
-    failed_files = sum(1 for r in results if r.get("status") == "failed")
-
-    logger.info(f"📊 Итог: успешно={successful_files}, ошибок={failed_files}, квалификаций={len(qualification_results)}")
+    successful_files = sum(1 for r in results if r["status"] == "success")
+    failed_files = sum(1 for r in results if r["status"] == "failed")
 
     return {
         "uploaded_files": len(results),
