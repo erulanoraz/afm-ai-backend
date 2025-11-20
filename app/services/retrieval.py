@@ -2,8 +2,8 @@
 import logging
 import re
 from typing import List, Dict, Any, Optional
-from sqlalchemy.orm import Session
 from uuid import UUID
+from sqlalchemy.orm import Session
 
 from app.db.models import File, Chunk
 
@@ -11,19 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 🧼 Нормализация текста (Kazakhstan-ready, безопасная)
+# 🔥 Нормализация текста (Kazakhstan legal safe)
 # ============================================================
 
 def normalize_text(text: str) -> str:
     if not text:
         return ""
 
-    # normalize newlines, spaces
     text = text.replace("\r", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{2,}", "\n", text)
 
-    # ⚠️ Удаляем ТОЛЬКО технический шум, НЕ фабулу
     garbage = [
         r"©\s?Все права защищены",
         r"сканировано\s?с\s?помощью.*",
@@ -31,9 +29,8 @@ def normalize_text(text: str) -> str:
         r"Документ создан.*",
         r"QR[- ]?код.*",
         r"электронный документ.*",
-        r"Просмотрено на.*",
+        r"Просмотрено.*",
         r"Дата печати.*",
-        # подпись разрешено оставлять — важно
     ]
 
     for g in garbage:
@@ -42,19 +39,43 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+# ============================================================
+# 🔥 Оценка чанка (baseline weight)
+# ============================================================
+
+def baseline_weight(filename: str, text: str) -> float:
+    fn = filename.lower()
+    t = text.lower()
+
+    # супер важные документы
+    strong = [
+        "рапорт", "куи", "ердр", "протокол_допроса_подозреваем",
+        "протокол допроса подозреваем",
+    ]
+    medium = [
+        "протокол_допроса_потерпевшего",
+        "протокол_допроса_потерпевш",
+        "постановление о признании лица потерпевшим",
+        "постановление о признании лица гражданским истцом",
+    ]
+
+    if any(x in fn for x in strong):
+        return 1.0
+
+    if any(x in t for x in ["он подозревается", "она подозревается"]):
+        return 0.95
+
+    if any(x in fn for x in medium):
+        return 0.80
+
+    if "постановление" in fn:
+        return 0.70
+
+    return 0.40
+
 
 # ============================================================
-# 🧠 Лемматизация RU/KZ — безопасная
-# ============================================================
-
-def lemmatize(text: str) -> str:
-    # пока просто нормализуем
-    return normalize_text(text)
-
-
-
-# ============================================================
-# 🔥 Главная функция Retrieval 3.1
+# 🔥 Retrieval 4.0 — главный
 # ============================================================
 
 def get_file_docs_for_qualifier(
@@ -96,133 +117,38 @@ def get_file_docs_for_qualifier(
             continue
 
         if not chunks:
-            logger.warning(f"⚠️ Файл {file_id} пуст — пропускаю.")
             continue
 
         for ch in chunks:
-            raw_text = getattr(ch, "text", "") or ""
-            clean_text = lemmatize(raw_text)
+            raw_text = (ch.text or "").strip()
+            if not raw_text:
+                continue
 
-            if not clean_text.strip():
+            clean = normalize_text(raw_text)
+            if not clean:
                 continue
 
             docs.append({
                 "file_id": file_id,
+                "filename": f.filename,
                 "page": ch.page or 1,
                 "chunk_id": str(ch.chunk_id),
-                "text": clean_text,
+                "text": clean,
             })
 
-    # -----------------------------
-    # 🍀 Лог после наполнения docs
-    # -----------------------------
-    logger.info("=== RETRIEVAL OUTPUT START ===")
-    for d in docs[:20]:
-        txt = d.get("text", "").replace("\n", " ")
-        logger.info(f"PAGE={d.get('page')} | LEN={len(txt)} | {txt[:300]}")
-    logger.info("=== RETRIEVAL OUTPUT END ===")
+    # ===========================================================
+    # 🔥 BASELINE сортировка по важности документа
+    # ===========================================================
+    for d in docs:
+        d["baseline_weight"] = baseline_weight(
+            filename=d["filename"],
+            text=d["text"]
+        )
 
-    logger.info(f"📦 Retrieval 3.1 вернул документов: {len(docs)}")
+    docs = sorted(docs, key=lambda x: x["baseline_weight"], reverse=True)
+
+    # Ограничение — не более 400 чанков
+    docs = docs[:400]
+
+    logger.info(f"📦 Retrieval 4.0 вернул документов: {len(docs)}")
     return docs
-
-
-
-# ============================================================
-# 🔹 Чанки по file_id
-# ============================================================
-
-def get_chunks_by_file_id(db: Session, file_id: str) -> List[Dict[str, Any]]:
-    try:
-        chunks = (
-            db.query(Chunk)
-            .filter(Chunk.file_id == UUID(file_id))
-            .order_by(
-                Chunk.page.asc(),
-                Chunk.start_offset.asc(),
-                Chunk.created_at.asc(),
-            )
-            .all()
-        )
-    except Exception as e:
-        logger.error(f"❌ Ошибка get_chunks_by_file_id({file_id}): {e}")
-        return []
-
-    result = []
-
-    for ch in chunks:
-        clean_text = lemmatize(getattr(ch, "text", "") or "")
-        result.append({
-            "chunk_id": str(ch.chunk_id),
-            "file_id": file_id,
-            "page": ch.page or 1,
-            "text": clean_text,
-            "metadata": {
-                "start_offset": getattr(ch, "start_offset", None),
-                "created_at": getattr(ch, "created_at", None),
-            },
-        })
-
-    if not result:
-        logger.warning(f"⚠️ Файл {file_id} вернул 0 чанков. Создаю placeholder")
-        return [{
-            "chunk_id": f"{file_id}-empty",
-            "file_id": file_id,
-            "page": 1,
-            "text": "",
-            "metadata": {}
-        }]
-
-    return result
-
-
-
-# ============================================================
-# 📊 Статистика (улучшенная)
-# ============================================================
-
-def get_file_text_stats(db: Session, case_id: str) -> Dict[str, Any]:
-    try:
-        files = db.query(File).filter(File.case_id == case_id).all()
-
-        stats = {
-            "case_id": case_id,
-            "total_files": len(files),
-            "files_with_chunks": 0,
-            "total_chunks": 0,
-            "total_chars": 0,
-            "files": [],
-        }
-
-        for f in files:
-            file_id = str(f.file_id)
-
-            chunks = (
-                db.query(Chunk)
-                (Chunk.file_id == UUID(file_id))
-                .all()
-            )
-
-            total_text = sum(len(c.text or "") for c in chunks)
-
-            stats["total_chunks"] += len(chunks)
-            stats["total_chars"] += total_text
-            stats["files_with_chunks"] += 1 if chunks else 0
-
-            stats["files"].append({
-                "file_id": file_id,
-                "filename": f.filename,
-                "chunks": len(chunks),
-                "text_length": total_text,
-            })
-
-        logger.info(
-            f"📊 Retrieval Stats: файлов={stats['total_files']}, "
-            f"чанков={stats['total_chunks']}, "
-            f"символов={stats['total_chars']}"
-        )
-
-        return stats
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка get_file_text_stats: {e}")
-        return {"error": str(e)}

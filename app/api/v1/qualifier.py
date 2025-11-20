@@ -12,6 +12,7 @@ from app.services.retrieval import get_file_docs_for_qualifier
 from app.services.agents.ai_qualifier import qualify_documents, LLMUnavailableError, validate_facts_completeness
 from app.services.export.pdf_generator import generate_postanovlenie_pdf
 from app.services.reranker import LLMReranker
+from app.services.agents.ai_extractor import super_pre_filter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["AI Qualifier"])
@@ -93,13 +94,27 @@ def qualify_final_document(
 
         logger.info(f"Загружено {len(docs)} документов")
 
-        # 🟩 🆕 RERANKER 2.0 — обязательно передать в квалификатор только лучшие факты
+        for d in docs:
+            txt = (d.get("text") or "").strip()
+            d["sentences"] = super_pre_filter(txt)
+
+
+        # 🟩 RERANKER — выбираем ключевые документы
         reranker = LLMReranker()
 
-        docs = reranker.rerank("квалификация деяния подозреваемого", docs)
-        docs = docs[:25]  # только самые релевантные 25 фрагментов
+        docs = reranker.rerank(
+            "квалификация деяния подозреваемого",
+            docs
+        )
+
+        # Новая СОРТИРОВКА — только по cross_score!
+        docs = sorted(docs, key=lambda x: x.get("cross_score", 0.0), reverse=True)
+
+        # Оставляем топ-25 самых важных фрагментов
+        docs = docs[:25]
 
         logger.info(f"После rerank осталось {len(docs)} лучших документов")
+
 
         # 3️⃣ Запускаем AI-квалификатор
         logger.info("Запуск AI-квалификатора")
