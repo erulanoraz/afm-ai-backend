@@ -1,294 +1,487 @@
 # app/services/ocr_worker.py
 
 import os
-import pytesseract
-from pdf2image import convert_from_path, pdfinfo_from_path
-from PIL import Image
 import logging
-import tempfile
+from io import BytesIO
+from typing import Optional, List
+
 import cv2
 import numpy as np
+import pytesseract
+from pdf2image import convert_from_path, convert_from_bytes
+from PyPDF2 import PdfReader
+from PIL import Image
+
 from app.utils.config import settings
 
 logger = logging.getLogger(__name__)
+ocr_corr_logger = logging.getLogger("OCR_CORRECTOR")
 
 # ============================================================
 # ⚙️ Инициализация Tesseract + Poppler
 # ============================================================
 
+# путь к tesseract.exe из .env / config
 pytesseract.pytesseract.tesseract_cmd = settings.TESSERACT_PATH
-POPPLER_PATH = settings.POPPLER_PATH
+POPPLER_PATH = getattr(settings, "POPPLER_PATH", None)
 
-OCR_LANG = "rus+kaz"
-OCR_CONFIG = "--oem 1 --psm 1"  # LSTM engine + automatic layout
+# OCR языки
+OCR_LANG = os.getenv("OCR_LANG", "rus+kaz+eng")
+
+# базовые параметры Tesseract
+OCR_OEM = 1
+PSM_CANDIDATES = [6, 4, 3]  # 6 — блок текста, 4 — колонки, 3 — авто
 
 
 # ============================================================
-# 🖼️ Предобработка изображения
+# 🔧 Вспомогательные функции
 # ============================================================
 
-def preprocess_image(image: Image.Image) -> Image.Image:
+def _normalize_ocr_text(text: str) -> str:
     """
-    Улучшает читаемость OCR:
-    - grayscale
-    - denoise
-    - Otsu threshold
-    - morphological operations
-    - convert back to RGB
+    Лёгкая нормализация OCR-результата:
+    - убираем технический мусор
+    - чистим множественные пробелы и лишние переносы
+    """
+    if not text:
+        return ""
+
+    t = text.replace("\r", "")
+
+    # убираем "--- Page X ---" и подобные служебные строки
+    import re
+    t = re.sub(r"-{2,}\s*Page\s*\d+\s*-{2,}", "", t, flags=re.IGNORECASE)
+
+    # типичный мусор из сканов/штампов
+    garbage_patterns = [
+        r"сканировано\s*с\s*помощью.*",
+        r"©\s*Все права защищены.*",
+        r"QR[- ]?код.*",
+        r"электронный документ.*",
+        r"Документ создан.*",
+        r"страница\s*\d+\s*из\s*\d+.*",
+    ]
+    for g in garbage_patterns:
+        t = re.sub(g, "", t, flags=re.IGNORECASE)
+
+    # нормализация пробелов/переносов
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+
+    return t.strip()
+
+
+def _preprocess_image(image: Image.Image) -> Image.Image:
+    """
+    Базовая предобработка для Standard OCR:
+    - перевод в оттенки серого
+    - лёгкий бинарный трешхолд
     """
     try:
-        cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        img = np.array(image)
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img
 
-        denoised = cv2.fastNlMeansDenoising(
-            gray, None, h=10, templateWindowSize=7, searchWindowSize=21
+        # лёгкая бинаризация для повышения контраста
+        _, thresh = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
         )
-
-        _, binary = cv2.threshold(
-            denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-
-        result = Image.fromarray(binary).convert("RGB")
-        return result
-
+        return Image.fromarray(thresh)
     except Exception as e:
-        logger.warning(f"⚠️ Ошибка preprocess_image: {e}")
+        logger.warning(f"⚠️ Ошибка предобработки изображения: {e}")
         return image
 
 
 # ============================================================
-# 🔧 Общий OCR по списку страниц (PIL Images)
+# 🧠 LLM-корректор для OCR (опционально)
 # ============================================================
 
-def _ocr_pages(
-    pages,
-    start_page_index: int = 1,
+import json
+import requests
+
+
+_OCR_CORRECTOR_ENABLED = bool(getattr(settings, "OCR_CORRECTOR_ENABLED", True))
+_OCR_CORRECTOR_URL = getattr(settings, "OCR_CORRECTOR_URL", None) or getattr(
+    settings, "LLM_GATEWAY_URL", None
+)
+_OCR_CORRECTOR_MODEL = getattr(settings, "OCR_CORRECTOR_MODEL", "gpt-4o-mini")
+_OCR_CORRECTOR_API_KEY = getattr(settings, "OCR_CORRECTOR_API_KEY", None)
+
+
+def _correct_ocr_with_llm(raw_text: str, page_num: int) -> str:
+    """
+    Лёгкая пост-коррекция OCR через LLM.
+    Стандартный режим — без перефразирования, только:
+      - исправление ошибок распознавания
+      - восстановление пунктуации
+      - объединение разорванных строк
+    Если корректировка недоступна — возвращаем raw_text.
+    """
+    if not raw_text:
+        return raw_text
+
+    if not (_OCR_CORRECTOR_ENABLED and _OCR_CORRECTOR_URL):
+        return raw_text
+
+    try:
+        ocr_corr_logger.info(
+            f"🧠 OCR_CORRECTOR: page={page_num}, len={len(raw_text)}"
+        )
+
+        system_prompt = (
+            "Ты помогаешь исправлять результат OCR российских/казахстанских "
+            "юридических документов (протоколы, постановления, рапорты). "
+            "Исправляй только опечатки и артефакты сканирования, не добавляй "
+            "новых слов и не меняй смысл. Сохраняй структуру текста."
+        )
+
+        payload = {
+            "model": _OCR_CORRECTOR_MODEL,
+            "temperature": 0.0,
+            "max_tokens": max(512, len(raw_text) // 3),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Страница: {page_num}\n\n"
+                        f"Вот текст после OCR. Очисти его и исправь только ошибки OCR:\n\n"
+                        f"{raw_text}"
+                    ),
+                },
+            ],
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if _OCR_CORRECTOR_API_KEY:
+            headers["Authorization"] = f"Bearer {_OCR_CORRECTOR_API_KEY}"
+
+        resp = requests.post(
+            _OCR_CORRECTOR_URL.rstrip("/") + "/v1/chat/completions",
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        if not content:
+            return raw_text
+
+        return _normalize_ocr_text(content)
+
+    except Exception as e:
+        ocr_corr_logger.error(f"❌ OCR_CORRECTOR ошибка page={page_num}: {e}")
+        return raw_text
+
+
+# ============================================================
+# 🧾 OCR по Image (основная низкоуровневая функция)
+# ============================================================
+
+def run_tesseract_ocr_image(
+    image: Image.Image,
+    page_num: int = 1,
     use_preprocessing: bool = True,
-    log_prefix: str = "OCR",
-):
-    text_blocks = []
-    ocr_pages = 0
-    empty_pages = 0
-    total = len(pages)
+) -> str:
+    """
+    Запуск Tesseract по уже готовому PIL.Image.
+    Используется и Smart-OCR, и debug-эндпоинтом.
+    """
+    if use_preprocessing:
+        image = _preprocess_image(image)
 
-    for i, page in enumerate(pages, start=start_page_index):
+    for psm in PSM_CANDIDATES:
         try:
-            proc = preprocess_image(page) if use_preprocessing else page
-
+            config = f"--oem {OCR_OEM} --psm {psm}"
             text = pytesseract.image_to_string(
-                proc,
+                image,
                 lang=OCR_LANG,
-                config=OCR_CONFIG
+                config=config,
+            )
+            text = _normalize_ocr_text(text)
+            logger.debug(
+                f"OCR(page): стр.{page_num}, PSM={psm}, len={len(text)}"
             )
 
-            if text.strip():
-                ocr_pages += 1
-                text_blocks.append(f"\n--- Page {i} ---\n{text}")
-            else:
-                empty_pages += 1
-                logger.warning(f"⚠️ {log_prefix}: стр. {i} пустая")
-
+            if len(text.strip()) > 30:
+                # опционально: прогон через LLM-корректор
+                corrected = _correct_ocr_with_llm(text, page_num)
+                return corrected or text
         except Exception as e:
-            logger.error(f"❌ OCR ошибка на стр. {i}: {e}")
+            logger.error(f"❌ Tesseract error page={page_num}, PSM={psm}: {e}")
 
-        finally:
-            try: page.close()
-            except: pass
-            try:
-                if proc is not page:
-                    proc.close()
-            except: pass
-
-    logger.info(
-        f"📊 {log_prefix}: страниц={total}, OCR успешных={ocr_pages}, пустых={empty_pages}"
-    )
-
-    return "\n".join(text_blocks)
+    return ""
 
 
 # ============================================================
-# 📄 OCR целого PDF файла
+# 📄 OCR по PDF-странице (file_path + page_num)
 # ============================================================
+
+def run_tesseract_ocr(
+    file_path: str,
+    page_num: int,
+    use_preprocessing: bool = True,
+) -> str:
+    """
+    OCR одной страницы PDF по её номеру.
+    Используется Smart-OCR 5.x и debug/ocr.
+    """
+    try:
+        pages = convert_from_path(
+            file_path,
+            dpi=300,
+            poppler_path=POPPLER_PATH,
+            first_page=page_num,
+            last_page=page_num,
+            fmt="jpeg",
+        )
+
+        if not pages:
+            logger.warning(f"⚠️ convert_from_path не вернул стр.{page_num}")
+            return ""
+
+        image = pages[0]
+        text = run_tesseract_ocr_image(
+            image=image,
+            page_num=page_num,
+            use_preprocessing=use_preprocessing,
+        )
+        return text or ""
+    except Exception as e:
+        logger.error(f"❌ Ошибка OCR file={file_path}, page={page_num}: {e}")
+        return ""
+
+
+# ============================================================
+# 📚 Извлечение текста из PDF (Text-Layer → OCR-fallback)
+# ============================================================
+
+def _extract_pdf_text_layer(file_path: str) -> str:
+    """
+    Пытается вытащить текстовый слой через PyPDF2.
+    Если текста мало — вернётся пустая строка.
+    """
+    try:
+        reader = PdfReader(file_path)
+        pieces: List[str] = []
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                pieces.append(t)
+
+        full = "\n\n".join(pieces)
+        full = _normalize_ocr_text(full)
+
+        # если текст меньше 200 символов — считаем, что текстового слоя нет
+        if len(full) < 200:
+            return ""
+
+        logger.info(
+            f"📄 PDF text-layer обнаружен, длина={len(full)} символов "
+            f"(страниц={len(reader.pages)})"
+        )
+        return full
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка извлечения text-layer из PDF: {e}")
+        return ""
+
 
 def extract_text_from_pdf(
     file_path: str,
     dpi: int = 300,
     use_preprocessing: bool = True,
 ) -> str:
-    text_blocks = []
-
-    try:
-        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if size_mb > 50:
-            dpi = 200
-            logger.warning(f"📉 Большой PDF ({size_mb:.1f}MB) → DPI=200")
-
-        # pdfinfo
-        try:
-            info = pdfinfo_from_path(file_path, poppler_path=POPPLER_PATH)
-            pages = int(info.get("Pages", 0))
-            if pages > 500:
-                logger.error(f"⛔ PDF {pages} стр. > лимита 500")
-                return " "
-        except Exception:
-            pass
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pages = convert_from_path(
-                file_path,
-                dpi=dpi,
-                poppler_path=POPPLER_PATH,
-                output_folder=tmpdir,
-                fmt="jpeg",
-                thread_count=2,
-            )
-
-            full_text = _ocr_pages(
-                pages,
-                start_page_index=1,
-                use_preprocessing=use_preprocessing,
-                log_prefix="OCR(full)"
-            )
-            text_blocks.append(full_text)
-
-        final = "\n".join([t for t in text_blocks if t])
-
-        if not final.strip():
-            logger.warning("⚠️ extract_text_from_pdf вернул пусто")
-            return " "
-
-        return final
-
-    except Exception as e:
-        logger.error(f"❌ extract_text_from_pdf ошибка: {e}", exc_info=True)
-        return " "
-
-
-# ============================================================
-# 🧩 OCR одной PDF-страницы (совместимо с chunker.py)
-# ============================================================
-
-def run_tesseract_ocr(
-    file_path: str,
-    page_num: int | None = None,
-    use_preprocessing: bool = True,
-) -> str:
     """
-    Если page_num=None — OCR всего PDF.
-    Если page_num задан — OCR конкретной страницы.
+    High-level API:
+    1) Пытается использовать text-layer (PyPDF2)
+    2) Если text-layer слабый/отсутствует → OCR по страницам
+    Возвращает единый нормализованный текст.
     """
+    # 1) Сначала пробуем text-layer
+    text_layer = _extract_pdf_text_layer(file_path)
+    if text_layer:
+        return text_layer
 
-    # Полный файл
-    if page_num is None:
-        return extract_text_from_pdf(file_path, use_preprocessing=use_preprocessing)
-
-    # OCR одной страницы
+    # 2) OCR fallback по всем страницам
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pages = convert_from_path(
-                file_path,
-                dpi=300,
-                poppler_path=POPPLER_PATH,
-                output_folder=tmpdir,
-                fmt="jpeg",
-                first_page=page_num,
-                last_page=page_num,
-                thread_count=1,
-            )
-
-            if not pages:
-                logger.warning(f"⚠️ Не удалось извлечь изображение стр. {page_num}")
-                return ""
-
-            return _ocr_pages(
-                pages,
-                start_page_index=page_num,
-                use_preprocessing=use_preprocessing,
-                log_prefix="OCR(page)"
-            )
-
+        reader = PdfReader(file_path)
+        total_pages = len(reader.pages)
     except Exception as e:
-        logger.error(f"❌ run_tesseract_ocr ошибка на стр. {page_num}: {e}")
+        logger.error(f"❌ Не удалось прочитать PDF для OCR: {e}")
         return ""
 
+    logger.info(f"📖 OCR fallback по всему PDF, страниц={total_pages}")
 
-# ============================================================
-# 🖼️ OCR по отдельному изображению (используется SMART OCR)
-# ============================================================
-
-def run_tesseract_ocr_image(
-    image: Image.Image,
-    page_num: int | None = None,
-    use_preprocessing: bool = True,
-) -> str:
-    """
-    OCR для PIL.Image. Поддерживает page_num для логов.
-    """
-    try:
-        proc = preprocess_image(image) if use_preprocessing else image
-
-        text = pytesseract.image_to_string(
-            proc,
-            lang=OCR_LANG,
-            config=OCR_CONFIG,
+    all_pages: List[str] = []
+    for page_num in range(1, total_pages + 1):
+        t = run_tesseract_ocr(
+            file_path=file_path,
+            page_num=page_num,
+            use_preprocessing=use_preprocessing,
         )
+        if t.strip():
+            all_pages.append(t)
 
-        return text or ""
+    full = "\n\n".join(all_pages)
+    return _normalize_ocr_text(full)
+
+
+# ============================================================
+# 🧪 Вспомогательная функция для debug-эндпоинта
+# ============================================================
+
+def debug_ocr_single_page(
+    file_path: str,
+    page_num: int,
+    use_preprocessing: bool = True,
+) -> str:
+    """
+    Упрощённый OCR для /debug/ocr:
+    - только указанная страница
+    - те же настройки Standard OCR Mode
+    """
+    logger.info(f"🐞 DEBUG OCR: file={file_path}, page={page_num}")
+    return run_tesseract_ocr(
+        file_path=file_path,
+        page_num=page_num,
+        use_preprocessing=use_preprocessing,
+    )
+
+# =====================================================================
+# 🖼 OCR Image Mode (для debug / router_chunker совместимости)
+# =====================================================================
+
+
+
+def preprocess_image(image_bytes: bytes) -> Image.Image:
+    """
+    Подготовка изображения к OCR:
+    - конвертация в grayscale
+    - увеличение резкости
+    - бинаризация (adaptive threshold)
+    """
+    np_img = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return Image.open(BytesIO(image_bytes))
+
+    # grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # adaptive threshold
+    thr = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 10
+    )
+
+    # лёгкое повышение резкости
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    sharp = cv2.filter2D(thr, -1, kernel)
+
+    pil_image = Image.fromarray(sharp)
+    return pil_image
+
+
+def ocr_image_bytes(image: Image.Image) -> dict:
+    """
+    OCR для изображений (JPEG/PNG).
+    Возвращает dict вида:
+    {
+        "text": "...",
+        "conf": float
+    }
+    """
+    try:
+        text = pytesseract.image_to_string(
+            image,
+            lang=OCR_LANG,
+            config="--oem 1 --psm 6"
+        )
+        return {
+            "text": text.strip(),
+            "conf": 0.95  # для image OCR точность не можем измерить → ставим фиксированно
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка OCR изображения: {e}")
+        return {"text": "", "conf": 0.0}
+
+
+# =====================================================================
+# 📄 PDF text-layer (bytes) + fallback OCR (bytes)
+# Для router_chunker / debug-chunker
+# =====================================================================
+
+def extract_pdf_text_layer(pdf_bytes: bytes) -> list:
+    """
+    Возвращает постраничный список:
+    [
+      {"page": 1, "text": "..."},
+      {"page": 2, "text": "..."},
+      ...
+    ]
+    Работает через PyPDF2 по BytesIO.
+    """
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        pages = []
+
+        for i, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            pages.append({
+                "page": i,
+                "text": _normalize_ocr_text(text)
+            })
+
+        return pages
 
     except Exception as e:
-        logger.error(f"❌ run_tesseract_ocr_image ошибка на стр. {page_num}: {e}")
+        logger.error(f"❌ extract_pdf_text_layer ошибка: {e}")
+        return []
+
+
+def extract_pdf_text_fallback(pdf_bytes: bytes, page_num: int) -> str:
+    """
+    Fallback OCR одной страницы PDF по bytes.
+    Используется когда text-layer отсутствует или пустой.
+    """
+    try:
+        images = convert_from_bytes(
+            pdf_bytes,
+            dpi=300,
+            poppler_path=POPPLER_PATH,
+            first_page=page_num,
+            last_page=page_num,
+            fmt="jpeg"
+        )
+        if not images:
+            return ""
+
+        pil_img = images[0]
+        text = run_tesseract_ocr_image(
+            pil_img,
+            page_num=page_num,
+            use_preprocessing=True
+        )
+        return text.strip()
+
+    except Exception as e:
+        logger.error(f"❌ extract_pdf_text_fallback ошибка: {e}")
         return ""
-
-    finally:
-        try:
-            if proc is not image:
-                proc.close()
-        except:
-            pass
-
-
-# ============================================================
-# 🧪 OCR по байтам PDF (если нужно для ingest_service)
-# ============================================================
-
-def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300):
-    """
-    Возвращает (text, confidence, pages_count)
-    """
-    confidence = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(pdf_bytes)
-            tmp.flush()
-            tmp_path = tmp.name
-
-        text = extract_text_from_pdf(tmp_path, dpi=dpi)
-        try:
-            os.remove(tmp_path)
-        except:
-            pass
-
-        return text, confidence, None
-
-    except Exception as e:
-        logger.error(f"❌ ocr_pdf_bytes ошибка: {e}")
-        return "", None, None
-
-
-# ============================================================
-# 🖼️ OCR по изображению (bytes → PIL → текст)
-# ============================================================
-
-def ocr_image_bytes(img_bytes: bytes):
-    try:
-        img = Image.open(tempfile.SpooledTemporaryFile())
-        img.file = img_bytes
-        text = run_tesseract_ocr_image(img)
-        return text, None
-    except Exception as e:
-        logger.error(f"❌ ocr_image_bytes ошибка: {e}")
-        return "", None

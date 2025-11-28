@@ -12,6 +12,21 @@ from app.db.models import Base
 from app.utils.config import settings
 from app.api.v1 import upload, qualifier, schema
 
+
+from app.api.debug.router_ingest import router as debug_ingest_router
+from app.api.debug.router_ocr import router as debug_ocr_router
+from app.api.debug.router_chunker import router as debug_chunker_router
+from app.api.debug.router_embeddings import router as debug_embeddings_router
+from app.api.debug.router_retrieval import router as debug_retrieval_router
+from app.api.debug.router_reranker import router as debug_reranker_router
+from app.api.debug.router_tokenizer import router as debug_tokenizer_router
+from app.api.debug.router_facts import router as debug_facts_router
+from app.api.debug.router_router import router as debug_router_router
+from app.api.debug.router_qualifier import router as debug_qualifier_router
+from app.api.debug.diagnostics import router as diagnostics_router
+
+
+
 # ================================================================
 # Настройка логирования
 # ================================================================
@@ -24,7 +39,32 @@ logging.basicConfig(
         logging.FileHandler("afm_legal.log", encoding="utf-8")
     ]
 )
+
 logger = logging.getLogger("AFM_Legal")
+
+# ==========================================
+# 🔇 Полное отключение pdfminer логов
+# ==========================================
+import logging
+
+PDFMINER_MODULES = [
+    "pdfminer",
+    "pdfminer.psparser",
+    "pdfminer.pdfdocument",
+    "pdfminer.pdftypes",
+    "pdfminer.pdfinterp",
+    "pdfminer.pdfpage",
+    "pdfminer.cmapdb",
+    "pdfminer.layout",
+    "pdfminer.converter",
+    "pdfminer.image",
+]
+
+for module in PDFMINER_MODULES:
+    log = logging.getLogger(module)
+    log.setLevel(logging.ERROR)
+    log.propagate = False
+
 
 # ================================================================
 # Настройка базы данных
@@ -121,6 +161,21 @@ app.add_middleware(
 app.include_router(upload.router, prefix="/api/v1", tags=["Upload"])
 app.include_router(qualifier.router, tags=["AI Qualifier"])  # prefix внутри router
 app.include_router(schema.router, prefix="/api/v1", tags=["Schema"])
+
+
+# включение debug API
+if settings.DEBUG:
+    app.include_router(debug_ingest_router)
+    app.include_router(debug_ocr_router)
+    app.include_router(debug_chunker_router)
+    app.include_router(debug_embeddings_router)
+    app.include_router(debug_retrieval_router)
+    app.include_router(debug_reranker_router)
+    app.include_router(debug_tokenizer_router)
+    app.include_router(debug_facts_router)
+    app.include_router(debug_router_router)
+    app.include_router(debug_qualifier_router)
+    app.include_router(diagnostics_router)
 
 
 # ================================================================

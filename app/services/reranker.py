@@ -1,5 +1,6 @@
 # app/services/reranker.py
 import re
+import json
 import logging
 from typing import List, Dict, Any
 
@@ -7,170 +8,159 @@ from app.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
+TOP_RERANK_OUTPUT = 50  # ← было 120, теперь меньше но качественнее
 
-# ============================================================
-# 🧹 Мягкая очистка текста (ничего важного не удаляем)
-# ============================================================
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-
-    t = text.strip()
-
-    garbage = [
-        r"©\s?Все права защищены",
-        r"сканировано\s?с\s?помощью.*",
-        r"страница\s?\d+\s?из\s?\d+",
-        r"QR[- ]?код.*",
-        r"Документ создан.*",
-        r"электронный документ.*",
-        r"Просмотрено на.*",
-        r"Дата печати.*",
-    ]
-    for g in garbage:
-        t = re.sub(g, "", t, flags=re.IGNORECASE)
-
-    t = re.sub(r"\s{2,}", " ", t)
-    return t.strip()
-
-
-# ============================================================
-# 🔥 RERANKER PRO 4.1 — baseline + LLM, без final_score
-# ============================================================
 
 class LLMReranker:
-    """
-    Reranker PRO 4.1:
-    • baseline приоритет по типу документа
-    • LLM-оценка релевантности (0–1)
-    • итоговый скор: cross_score = baseline + llm_score
-    """
-
     def __init__(self):
         self.llm = LLMClient()
 
+    # ============================================================
+    # 🔧 Локальный baseline
+    # ============================================================
     def _compute_baseline_score(self, doc: Dict[str, Any]) -> float:
+        """Простой baseline по типу файла"""
         fn = (doc.get("filename") or "").lower()
-        txt = (doc.get("clean_text") or "").lower()
+        txt = (doc.get("text") or "").lower()
 
         score = 0.0
 
-        # 🔹 Файловые маркеры
-        strong_filename_markers = [
-            "протокол_допроса_подозреваемого",
-            "протокол_допроса_подозреваемой",
-            "рапорт_куи",
-            "ердр",
-            "рапорт_о_регистрации",
-        ]
-        medium_filename_markers = [
-            "протокол_допроса_потерпевшего",
-            "постановление_о_признании_лица_потерпевшим",
-            "постановление_о_признании_лица_гражданским_истцом",
-            "постановление_о_возбуждении",
-        ]
+        # Протоколы допроса подозреваемого — ГЛАВНОЕ
+        if any(m in fn for m in ["протокол_допроса_подозреваем", "допроса подозреваем", "куи"]):
+            score += 3.0
 
-        # 🔹 Текстовые маркеры
-        strong_text_markers = [
-            "протокол допроса подозреваемого",
-            "протокол допроса подозреваемой",
-            "сообщено о подозрении",
-            "он подозревается",
-            "она подозревается",
-            "в качестве подозреваемого",
-        ]
-        soft_text_markers = [
-            "допрос потерпевшего",
-            "допрос свидетель",
-            "потерпевший пояснил",
-            "потерпевшая пояснила",
-        ]
+        # Рапорты, ердр
+        if any(m in fn for m in ["рапорт", "ердр"]):
+            score += 2.5
 
-        if any(m in fn for m in strong_filename_markers):
-            score += 2.0
-        if any(m in fn for m in medium_filename_markers):
+        # Допросы потерпевших
+        if any(m in fn for m in ["допроса_потерпевш", "допроса потерпевш"]):
+            score += 1.5
+
+        # Постановления
+        if "постановление" in fn:
             score += 1.0
 
-        if any(m in txt for m in strong_text_markers):
-            score += 2.0
-        if any(m in txt for m in soft_text_markers):
+        # Ключевые слова в тексте
+        if any(k in txt for k in ["он подозревается", "она подозревается", "совершил"]):
+            score += 0.8
+
+        if any(k in txt for k in ["перевел", "получил", "внес", "вложил"]):
+            score += 0.6
+
+        if any(k in txt for k in ["тенге", "тг", "денежные средства", "ущерб"]):
             score += 0.5
 
         return score
 
-    def rerank(self, query: str, items: List[Dict[str, Any]], top_k: int = 75) -> List[Dict[str, Any]]:
+    # ============================================================
+    # 🔥 ИСПРАВЛЕННЫЙ rerank с ROBUST JSON парсингом
+    # ============================================================
+    def rerank(self, query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Ранжирование с LLM + падбэком на baseline.
+        ГЛАВНОЕ: robust JSON парсинг!
+        """
         if not items:
             return []
 
-        # 1️⃣ Очистка текста
         cleaned_items: List[Dict[str, Any]] = []
+        
         for it in items:
-            cleaned = clean_text(it.get("text", "") or "")
-            if not cleaned:
+            text = it.get("text") or ""
+            if len(text) < 20:
                 continue
-            n = dict(it)
-            n["clean_text"] = cleaned
-            cleaned_items.append(n)
+            
+            doc = dict(it)
+            doc["clean_text"] = text[:500]  # ограничиваем длину
+            cleaned_items.append(doc)
 
         if not cleaned_items:
-            logger.warning("⚠ Reranker: после очистки нет текстов")
             return []
 
-        # 2️⃣ baseline-оценка (без LLM)
-        for doc in cleaned_items:
-            doc["baseline_score"] = self._compute_baseline_score(doc)
+        # 1) Baseline score
+        for d in cleaned_items:
+            d["baseline_score"] = self._compute_baseline_score(d)
 
-        # 3️⃣ LLM-оценка (мягкая, с fallback)
-        snippets = [
-            f"{i+1}. {doc['clean_text'][:500]}"
-            for i, doc in enumerate(cleaned_items)
-        ]
+        # 2) Подготовка для LLM (КОРОЧЕ!)
+        snippets: List[str] = []
+        for i, doc in enumerate(cleaned_items):
+            prefix = f"[{i}] {doc.get('filename', '')} стр.{doc.get('page', '?')}: "
+            body = doc["clean_text"][:300]
+            snippets.append(prefix + body)
 
-        prompt = f"""
-Ты — модель ранжирования. Оцени релевантность каждого фрагмента
-к запросу по шкале от 0.0 до 1.0.
+        # 3) ПРОСТОЙ prompt (без сложности)
+        system_prompt = (
+            "Ты — оцениватель релевантности для уголовного дела. "
+            "Оцени каждый документ от 0.0 до 1.0. "
+            "0.0 = неважно, 1.0 = очень важно."
+        )
 
-Верни ТОЛЬКО JSON-массив чисел, например:
-[0.91, 0.12, 0.44]
+        user_prompt = f"""
+Оцени релевантность документов. Верни ТОЛЬКО JSON массив чисел: [0.8, 0.3, 0.9, ...]
 
-Запрос:
-"{query}"
+Ищем: факты преступления, переводы денег, обман, действия подозреваемого.
 
-Фрагменты:
-{chr(10).join(snippets)}
+Документы:
+{chr(10).join(snippets[:20])}
+
+Ответ (только JSON):
 """
 
+        # 4) LLM scoring с ROBUST парсингом
         llm_scores = [0.0] * len(cleaned_items)
 
         try:
-            resp = self.llm.chat([{"role": "user", "content": prompt}])
-            resp_text = str(resp)
-            numbers = re.findall(r"-?\d+(?:\.\d+)?", resp_text)
+            resp = self.llm.chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ])
 
-            for i, num in enumerate(numbers[:len(cleaned_items)]):
-                try:
-                    llm_scores[i] = float(num)
-                except Exception:
-                    continue
+            # Вариант 1: чистый JSON массив
+            try:
+                parsed = json.loads(resp.strip())
+                if isinstance(parsed, list):
+                    for i, val in enumerate(parsed[:len(cleaned_items)]):
+                        if isinstance(val, (int, float)):
+                            llm_scores[i] = float(val)
+            except json.JSONDecodeError:
+                pass
 
-            logger.info(f"Reranker LLM: получили {len(numbers)} чисел для {len(cleaned_items)} фрагментов")
+            # Вариант 2: JSON в строке
+            if llm_scores == [0.0] * len(cleaned_items):
+                match = re.search(r"\[[\d\.,\s]+\]", resp)
+                if match:
+                    try:
+                        parsed = json.loads(match.group(0))
+                        if isinstance(parsed, list):
+                            for i, val in enumerate(parsed[:len(cleaned_items)]):
+                                if isinstance(val, (int, float)):
+                                    llm_scores[i] = float(val)
+                    except json.JSONDecodeError:
+                        pass
+
+            # Вариант 3: Regex вытаскиваем числа
+            if llm_scores == [0.0] * len(cleaned_items):
+                nums = re.findall(r"0?\.\d+", resp)
+                for i, num_str in enumerate(nums[:len(cleaned_items)]):
+                    try:
+                        llm_scores[i] = float(num_str)
+                    except ValueError:
+                        pass
+
+            logger.info(f"✅ Reranker: LLM оценки = {llm_scores}")
 
         except Exception as e:
-            logger.error(f"❌ Reranker LLM error, работаем только на baseline: {e}")
-            # llm_scores остаются по 0.0
+            logger.error(f"⚠️ LLM error: {e}, используем baseline")
 
-        # 4️⃣ Итоговый скор: cross_score = baseline + llm_score
-        for doc, llm_s in zip(cleaned_items, llm_scores):
-            doc["llm_score"] = float(llm_s)
-            doc["cross_score"] = float(doc.get("baseline_score", 0.0)) + float(llm_s)
+        # 5) Комбинируем baseline + LLM
+        for d, llm_s in zip(cleaned_items, llm_scores):
+            baseline_s = float(d["baseline_score"]) / 4.0  # нормализуем
+            d["llm_score"] = float(llm_s)
+            d["cross_score"] = baseline_s * 0.4 + llm_s * 0.6
 
-        # 5️⃣ Сортировка по cross_score
-        sorted_items = sorted(
-            cleaned_items,
-            key=lambda d: d.get("cross_score", 0.0),
-            reverse=True,
-        )
+        # 6) Сортировка
+        sorted_items = sorted(cleaned_items, key=lambda d: d["cross_score"], reverse=True)
 
-        # 6️⃣ Возвращаем TOP K
-        return sorted_items[:min(top_k, len(sorted_items))]
+        logger.info(f"📊 Reranker output: {len(sorted_items[:TOP_RERANK_OUTPUT])} документов")
+        return sorted_items[:TOP_RERANK_OUTPUT]

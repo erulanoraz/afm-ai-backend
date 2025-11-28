@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     )
     
     # ==========================================
+    # Пути к OCR и Poppler
+    # ==========================================
+    TESSERACT_PATH: str = Field(
+        default=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        description="Путь к Tesseract OCR"
+    )
+
+    POPPLER_PATH: str = Field(
+        default=r"C:\Users\User\Desktop\poppler-25.07.0\Library\bin",
+        description="Путь к Poppler (pdfinfo/pdftoppm)"
+    )
+
+    # ==========================================
     # LLM / AI Qualifier
     # ==========================================
     LLM_API_URL: str = Field(
@@ -74,6 +87,7 @@ class Settings(BaseSettings):
         le=5,
         description="Количество повторных попыток"
     )
+
     
     # ==========================================
     # Гибридный поиск
@@ -96,6 +110,30 @@ class Settings(BaseSettings):
     ES_INDEX_PREFIX: str = Field(default="afm_legal", description="Префикс индексов")
     ES_TIMEOUT: int = Field(default=30, description="Таймаут OpenSearch (сек)")
     
+
+    # ==========================================
+    # Celery / Redis
+    # ==========================================
+    REDIS_URL: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis URL для Celery брокера"
+    )
+
+
+    # ==========================================
+    # Weaviate / Embeddings
+    # ==========================================
+    WEAVIATE_URL: str = Field(
+        default="http://localhost:8080",
+        description="Weaviate endpoint"
+    )
+
+    LLM_EMBEDDING_URL: str = Field(
+        default="http://localhost:8080/v1/embeddings",
+        description="Embedding endpoint (Weaviate)"
+    )
+
+
     # ==========================================
     # Anti-hallucination / Verification
     # ==========================================
@@ -409,9 +447,3 @@ if __name__ == "__main__":
         print("\n✅ Все сервисы доступны!")
     else:
         print("\n⚠️  Некоторые сервисы недоступны. Проверьте конфигурацию.")
-
-
-
-TESSERACT_PATH: str = os.getenv("TESSERACT_PATH", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-POPPLER_PATH: str = os.getenv("POPPLER_PATH", r"C:\poppler-25.07.0\Library\bin")
-    

@@ -37,6 +37,12 @@ class Chunk(Base):
     text = Column(Text, nullable=False)
     meta = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    evidence = Column(JSON, nullable=True)
+    entities = Column(JSON, nullable=True)
+    events = Column(JSON, nullable=True)
+    facts = Column(JSON, nullable=True)
+    SLG = Column(JSON, nullable=True)
+    section_detection = Column(JSON, nullable=True)
 
     # обратная связь с File
     file = relationship("File", back_populates="chunks")

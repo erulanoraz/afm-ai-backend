@@ -6,31 +6,39 @@ import zipfile
 import shutil
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, Dict
 
-from fastapi import APIRouter, Depends, UploadFile, File as FastAPIFile, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    UploadFile,
+    File as FastAPIFile,
+    HTTPException,
+)
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.db.models import File
-from app.services.chunker import (
-    process_any_file,
-    process_text_into_chunks
-)
 from app.services.parser import extract_text_from_file
-from app.services.retrieval import get_file_docs_for_qualifier
-from app.services.agents.ai_qualifier import qualify_documents
-from app.services.validation.verifier import run_full_verification
 from app.utils.config import settings
+
+# Celery-таск фоновой обработки файла (OCR + Chunker)
+from app.tasks.ingest import process_file_task
 
 # ============================================================
 # Константы
 # ============================================================
-MAX_FILE_SIZE_MB = getattr(settings, 'MAX_FILE_SIZE_MB', 100)
+MAX_FILE_SIZE_MB = getattr(settings, "MAX_FILE_SIZE_MB", 100)
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Директория, где будут лежать файлы для фоновой обработки
+DEFAULT_INGEST_DIR = os.path.join(tempfile.gettempdir(), "afm_ingest")
+INGEST_DIR = getattr(settings, "INGEST_DIR", DEFAULT_INGEST_DIR)
+os.makedirs(INGEST_DIR, exist_ok=True)
 
 router = APIRouter(prefix="/upload", tags=["Upload"])
 logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # Вспомогательные функции
@@ -50,11 +58,9 @@ def _extract_case_id_from_name(name: str) -> Optional[str]:
 def _extract_case_id_from_text(text: str) -> Optional[str]:
     """
     Пытается извлечь номер ЕРДР / дела из ТЕКСТА документа.
-    Работает и для текстовых PDF, и для DOCX/TXT, и для результатов OCR.
     """
     if not text:
         return None
-    # Ищем любую последовательность из 15 цифр
     m = re.search(r"(\d{15})", text)
     return m.group(1) if m else None
 
@@ -65,30 +71,41 @@ def _detect_case_id_for_file(
     outer_case_id: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Универсальный детектор номера дела для одного файла.
+    Evidence Engine style detector:
 
-    Порядок:
-    1) ищем в названии файла;
-    2) если не нашли — пытаемся вытащить текст (PDF/DOCX/TXT) и найти там;
+    1) пробуем вытащить case_id из имени файла;
+    2) если DOCX/TXT — пробуем вытащить текст и найти там;
     3) если не нашли — используем outer_case_id (для файлов внутри ZIP).
     """
+    if not filename:
+        filename = ""
+
+    ext = os.path.splitext(filename)[1].lower()
+
     # 1) По имени файла
     case_id = _extract_case_id_from_name(filename)
     if case_id:
         logger.info(f"🔎 case_id={case_id} найден в названии файла: {filename}")
         return case_id
 
-    # 2) По тексту файла
-    try:
-        text = extract_text_from_file(file_path) or ""
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось извлечь текст из файла {filename} для поиска case_id: {e}")
-        text = ""
+    text: str = ""
+
+    # 2) По тексту файла — ТОЛЬКО для DOCX/TXT
+    if ext in [".docx", ".txt"]:
+        try:
+            text = extract_text_from_file(file_path) or ""
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Не удалось извлечь текст из файла {filename} для поиска case_id: {e}"
+            )
+            text = ""
 
     if text.strip():
         case_id_from_text = _extract_case_id_from_text(text)
         if case_id_from_text:
-            logger.info(f"🔎 case_id={case_id_from_text} найден в тексте файла: {filename}")
+            logger.info(
+                f"🔎 case_id={case_id_from_text} найден в тексте файла: {filename}"
+            )
             return case_id_from_text
 
     # 3) Fallback — берем case_id снаружи (например, из имени ZIP)
@@ -104,19 +121,48 @@ def _detect_case_id_for_file(
 
 
 def _validate_file_size(file: UploadFile) -> None:
-    if hasattr(file, 'size') and file.size:
+    if hasattr(file, "size") and file.size:
         if file.size > MAX_FILE_SIZE_BYTES:
             raise HTTPException(
                 status_code=413,
                 detail=(
                     f"Файл {file.filename} слишком большой ({file.size / 1024 / 1024:.1f} МБ). "
                     f"Максимальный размер: {MAX_FILE_SIZE_MB} МБ"
-                )
+                ),
             )
 
 
+def _store_for_ingest(src_path: str, file_id: uuid.UUID, ext: str) -> str:
+    """
+    Перекладываем файл в постоянную ingest-директорию,
+    чтобы фоновый Celery-таск мог с ним работать уже после ответа API.
+    """
+    os.makedirs(INGEST_DIR, exist_ok=True)
+    dst_path = os.path.join(INGEST_DIR, f"{file_id}{ext}")
+    # если файл уже есть — перезапишем
+    if os.path.exists(dst_path):
+        os.remove(dst_path)
+    shutil.move(src_path, dst_path)
+    return dst_path
+
+
+def _enqueue_ingest_job(file_id: uuid.UUID, stored_path: str, ext: str) -> None:
+    """
+    Кидаем задачу в Celery: обработать файл (OCR/Chunker и т.д.).
+    ВАЖНО: на этом этапе запись File уже должна быть закоммичена в БД.
+    """
+    try:
+        process_file_task.delay(str(file_id), stored_path, ext)
+        logger.info(
+            f"📨 Celery ingest task поставлена в очередь: file_id={file_id}, path={stored_path}"
+        )
+    except Exception as e:
+        # Даже если Celery не запущен, загрузка файлов не должна падать.
+        logger.error(f"❌ Не удалось поставить ingest-таск в очередь для {file_id}: {e}")
+
+
 # ============================================================
-# Основной endpoint
+# Evidence Engine INGEST v3.0
 # ============================================================
 
 @router.post("/")
@@ -124,36 +170,53 @@ async def upload_files(
     files: List[UploadFile] = FastAPIFile(...),
     db: Session = Depends(get_db),
 ):
-    results = []
-    case_ids_map = {}
+    """
+    Evidence Engine INGEST v3.0:
+
+    • Загрузка файлов максимально быстрая: API только пишет записи File в БД
+      и перекладывает файлы в ingest-директорию.
+    • Тяжёлый OCR/Chunker выполняются в Celery (фоново).
+    • Для КАЖДОГО файла:
+        - File создаётся и фиксируется (db.commit) до запуска Celery.
+        - Celery всегда видит запись в БД (нет ошибки "File ... не найден").
+    """
+    results: List[dict] = []
+    case_ids_map: Dict[str, List[str]] = {}
 
     logger.info(f"📤 Загружается файлов: {len(files)}")
 
     for file in files:
-        temp_path = None
+        temp_path: Optional[str] = None
 
         try:
             # 1) Проверка размера
             try:
                 _validate_file_size(file)
             except HTTPException as e:
-                results.append({
-                    "file_id": None,
-                    "filename": file.filename,
-                    "chunks_created": 0,
-                    "error": e.detail,
-                    "status": "failed",
-                })
+                results.append(
+                    {
+                        "file_id": None,
+                        "filename": file.filename,
+                        "chunks_created": 0,
+                        "error": e.detail,
+                        "status": "failed",
+                    }
+                )
                 continue
 
             # 2) Временное сохранение файла
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as tmp:
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=f"_{file.filename}"
+            ) as tmp:
                 temp_path = tmp.name
                 content = await file.read()
                 if len(content) > MAX_FILE_SIZE_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Файл {file.filename} слишком большой. Максимум: {MAX_FILE_SIZE_MB} МБ"
+                        detail=(
+                            f"Файл {file.filename} слишком большой. "
+                            f"Максимум: {MAX_FILE_SIZE_MB} МБ"
+                        ),
                     )
                 tmp.write(content)
 
@@ -161,7 +224,8 @@ async def upload_files(
             logger.info(f"📥 Загружен {file.filename}, размер {len(content)} байт")
 
             # ============================================================
-            # 3) ZIP
+            # 3) ZIP – распаковываем, каждый inner-файл регистрируем в БД
+            #      и отправляем в Celery отдельно
             # ============================================================
             if ext == ".zip":
                 extract_dir = tempfile.mkdtemp(prefix="unzipped_")
@@ -171,227 +235,255 @@ async def upload_files(
                 except zipfile.BadZipFile:
                     raise HTTPException(status_code=400, detail="ZIP файл повреждён")
 
-                # case_id, который удалось найти в ИМЕНИ самого ZIP
                 outer_case_id = _extract_case_id_from_name(file.filename)
                 if outer_case_id:
-                    logger.info(f"🔎 outer_case_id={outer_case_id} найден в имени ZIP {file.filename}")
+                    logger.info(
+                        f"🔎 outer_case_id={outer_case_id} найден в имени ZIP {file.filename}"
+                    )
                 else:
                     logger.info(f"ℹ️ В имени ZIP {file.filename} номер дела не найден")
 
-                zip_inner_ids = []
+                zip_inner_ids: List[str] = []
 
                 for root, _, inner_files in os.walk(extract_dir):
                     for inner_name in inner_files:
                         inner_path = os.path.join(root, inner_name)
                         inner_ext = os.path.splitext(inner_name)[1].lower()
+
                         if inner_ext not in [".pdf", ".docx", ".txt"]:
                             continue
 
                         inner_file_id = uuid.uuid4()
-                        with db.begin_nested():
-                            try:
-                                # 🔥 Новый умный поиск case_id:
-                                # 1) имя внутреннего файла
-                                # 2) текст/ОCR внутреннего файла
-                                # 3) outer_case_id (из имени ZIP)
-                                case_id_to_save = _detect_case_id_for_file(
-                                    file_path=inner_path,
-                                    filename=inner_name,
-                                    outer_case_id=outer_case_id,
+
+                        try:
+                            # 3.1 Определяем case_id
+                            case_id_to_save = _detect_case_id_for_file(
+                                file_path=inner_path,
+                                filename=inner_name,
+                                outer_case_id=outer_case_id,
+                            )
+
+                            # 3.2 Создаём запись в БД и СРАЗУ коммитим
+                            new_file = File(
+                                file_id=inner_file_id,
+                                filename=inner_name,
+                                case_id=case_id_to_save,
+                                s3_key=f"s3://afm-originals/{inner_name}",
+                                ocr_confidence=0.0,
+                                chunks_count=0,
+                            )
+                            db.add(new_file)
+                            db.commit()
+                            db.refresh(new_file)
+
+                            # 3.3 Перекладываем файл в ingest-директорию
+                            stored_path = _store_for_ingest(
+                                inner_path, inner_file_id, inner_ext
+                            )
+
+                            # 3.4 Кидаем ingest-задачу в Celery
+                            _enqueue_ingest_job(
+                                inner_file_id, stored_path, inner_ext
+                            )
+
+                            if case_id_to_save:
+                                case_ids_map.setdefault(case_id_to_save, []).append(
+                                    str(inner_file_id)
                                 )
 
-                                new_file = File(
-                                    file_id=inner_file_id,
-                                    filename=inner_name,
-                                    case_id=case_id_to_save,
-                                    s3_key=f"s3://afm-originals/{inner_name}",
-                                    ocr_confidence=0.9,
-                                )
-                                db.add(new_file)
-                                db.flush()
-
-                                chunks_created = 0
-                                if inner_ext == ".pdf":
-                                    # 🔁 Логика чанкинга не меняется
-                                    chunks_created = process_any_file(inner_path, inner_file_id, db)
-                                else:
-                                    text = extract_text_from_file(inner_path) or ""
-                                    if text.strip():
-                                        chunks_created = process_text_into_chunks(inner_file_id, text, db)
-
-                                new_file.chunks_count = chunks_created
-                                logger.info(f"📄 {inner_name}: создано чанков = {chunks_created}")
-
-                                if case_id_to_save:
-                                    case_ids_map.setdefault(case_id_to_save, []).append(str(inner_file_id))
-
-                                results.append({
+                            results.append(
+                                {
                                     "file_id": str(inner_file_id),
                                     "filename": inner_name,
-                                    "chunks_created": chunks_created,
+                                    "chunks_created": 0,
                                     "case_id": case_id_to_save,
                                     "s3_key": f"s3://afm-originals/{inner_name}",
-                                    "status": "success",
-                                })
+                                    "status": "queued",
+                                }
+                            )
+                            zip_inner_ids.append(str(inner_file_id))
 
-                                zip_inner_ids.append(str(inner_file_id))
-
-                            except Exception as e:
-                                logger.error(f"❌ Ошибка файла в ZIP {inner_name}: {e}")
-                                results.append({
+                        except Exception as e:
+                            db.rollback()
+                            logger.error(f"❌ Ошибка файла в ZIP {inner_name}: {e}")
+                            results.append(
+                                {
                                     "file_id": str(inner_file_id),
                                     "filename": inner_name,
                                     "chunks_created": 0,
                                     "error": str(e),
-                                    "status": "failed"
-                                })
+                                    "status": "failed",
+                                }
+                            )
 
-                # Итог по ZIP
-                total_chunks = sum(
-                    r.get("chunks_created", 0)
-                    for r in results
-                    if r.get("file_id") in zip_inner_ids
+                # ZIP как "обёртку" тоже отражаем в ответе (summary)
+                results.append(
+                    {
+                        "file_id": None,
+                        "filename": file.filename,
+                        "type": "zip_summary",
+                        "files_processed": len(zip_inner_ids),
+                        "chunks_created": 0,
+                        "case_id": outer_case_id,
+                        "status": "queued",
+                    }
                 )
-                results.append({
-                    "file_id": None,
-                    "filename": file.filename,
-                    "type": "zip_summary",
-                    "files_processed": len(zip_inner_ids),
-                    "chunks_created": total_chunks,
-                    "case_id": outer_case_id,
-                    "status": "success"
-                })
 
+                # исходники уже перенесены в INGEST_DIR, эту папку можно удалить
                 shutil.rmtree(extract_dir, ignore_errors=True)
+                # temp_path тоже больше не нужен
+                os.remove(temp_path)
+                temp_path = None
                 continue
 
             # ============================================================
-            # 4) PDF
+            # 4) PDF – создаём File, коммитим, отправляем в Celery
             # ============================================================
             if ext == ".pdf":
                 file_id = uuid.uuid4()
-                with db.begin_nested():
-                    try:
-                        # 🔥 Здесь теперь умный поиск case_id:
-                        case_id_extracted = _detect_case_id_for_file(
-                            file_path=temp_path,
-                            filename=file.filename,
-                            outer_case_id=None,
+                try:
+                    case_id_extracted = _detect_case_id_for_file(
+                        file_path=temp_path,
+                        filename=file.filename,
+                        outer_case_id=None,
+                    )
+
+                    new_file = File(
+                        file_id=file_id,
+                        filename=file.filename,
+                        case_id=case_id_extracted,
+                        s3_key=f"s3://afm-originals/{file.filename}",
+                        ocr_confidence=0.0,
+                        chunks_count=0,
+                    )
+                    db.add(new_file)
+                    db.commit()
+                    db.refresh(new_file)
+
+                    # Перекладываем PDF в ingest-директорию
+                    stored_path = _store_for_ingest(temp_path, file_id, ext)
+                    temp_path = None
+
+                    # Кидаем фоновую обработку
+                    _enqueue_ingest_job(file_id, stored_path, ext)
+
+                    if case_id_extracted:
+                        case_ids_map.setdefault(case_id_extracted, []).append(
+                            str(file_id)
                         )
 
-                        new_file = File(
-                            file_id=file_id,
-                            filename=file.filename,
-                            case_id=case_id_extracted,
-                            s3_key=f"s3://afm-originals/{file.filename}",
-                            ocr_confidence=0.9,
-                        )
-                        db.add(new_file)
-                        db.flush()
-
-                        # Логика чанкинга не меняется
-                        chunks_created = process_any_file(temp_path, file_id, db)
-                        new_file.chunks_count = chunks_created
-                        logger.info(f"📄 PDF {file.filename}: чанков = {chunks_created}")
-
-                        if case_id_extracted:
-                            case_ids_map.setdefault(case_id_extracted, []).append(str(file_id))
-
-                        results.append({
+                    results.append(
+                        {
                             "file_id": str(file_id),
                             "filename": file.filename,
-                            "chunks_created": chunks_created,
+                            "chunks_created": 0,
                             "case_id": case_id_extracted,
                             "s3_key": f"s3://afm-originals/{file.filename}",
-                            "status": "success",
-                        })
+                            "status": "queued",
+                        }
+                    )
 
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка PDF {file.filename}: {e}")
-                        results.append({
+                except Exception as e:
+                    db.rollback()
+                    logger.error(f"❌ Ошибка PDF {file.filename}: {e}")
+                    results.append(
+                        {
                             "file_id": str(file_id),
                             "filename": file.filename,
                             "chunks_created": 0,
                             "error": str(e),
                             "status": "failed",
-                        })
+                        }
+                    )
                 continue
 
             # ============================================================
-            # 5) DOCX / TXT
+            # 5) DOCX / TXT – аналогично PDF, но без OCR
             # ============================================================
             if ext in [".docx", ".txt"]:
                 file_id = uuid.uuid4()
-                with db.begin_nested():
-                    try:
-                        # 🔥 Аналогично ищем case_id и по имени, и по тексту
-                        case_id_extracted = _detect_case_id_for_file(
-                            file_path=temp_path,
-                            filename=file.filename,
-                            outer_case_id=None,
+                try:
+                    case_id_extracted = _detect_case_id_for_file(
+                        file_path=temp_path,
+                        filename=file.filename,
+                        outer_case_id=None,
+                    )
+
+                    new_file = File(
+                        file_id=file_id,
+                        filename=file.filename,
+                        case_id=case_id_extracted,
+                        s3_key=f"s3://afm-originals/{file.filename}",
+                        ocr_confidence=0.0,
+                        chunks_count=0,
+                    )
+                    db.add(new_file)
+                    db.commit()
+                    db.refresh(new_file)
+
+                    # Перекладываем файл в ingest-директорию
+                    stored_path = _store_for_ingest(temp_path, file_id, ext)
+                    temp_path = None
+
+                    # Ставим фоновую задачу
+                    _enqueue_ingest_job(file_id, stored_path, ext)
+
+                    if case_id_extracted:
+                        case_ids_map.setdefault(case_id_extracted, []).append(
+                            str(file_id)
                         )
 
-                        new_file = File(
-                            file_id=file_id,
-                            filename=file.filename,
-                            case_id=case_id_extracted,
-                            s3_key=f"s3://afm-originals/{file.filename}",
-                            ocr_confidence=0.95,
-                        )
-                        db.add(new_file)
-                        db.flush()
-
-                        text = extract_text_from_file(temp_path) or ""
-                        if not text.strip():
-                            raise ValueError("Пустой текст")
-
-                        chunks_created = process_text_into_chunks(file_id, text, db)
-                        new_file.chunks_count = chunks_created
-
-                        if case_id_extracted:
-                            case_ids_map.setdefault(case_id_extracted, []).append(str(file_id))
-
-                        results.append({
+                    results.append(
+                        {
                             "file_id": str(file_id),
                             "filename": file.filename,
-                            "chunks_created": chunks_created,
+                            "chunks_created": 0,
                             "case_id": case_id_extracted,
-                            "status": "success",
-                        })
+                            "status": "queued",
+                        }
+                    )
 
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка обработки {file.filename}: {e}")
-                        results.append({
+                except Exception as e:
+                    db.rollback()
+                    logger.error(f"❌ Ошибка обработки {file.filename}: {e}")
+                    results.append(
+                        {
                             "file_id": str(file_id),
                             "filename": file.filename,
                             "chunks_created": 0,
                             "error": str(e),
                             "status": "failed",
-                        })
+                        }
+                    )
                 continue
 
             # ============================================================
             # 6) Неподдерживаемый формат
             # ============================================================
-            results.append({
-                "file_id": None,
-                "filename": file.filename,
-                "chunks_created": 0,
-                "error": f"Неподдерживаемый формат: {ext}",
-                "status": "failed",
-            })
+            results.append(
+                {
+                    "file_id": None,
+                    "filename": file.filename,
+                    "chunks_created": 0,
+                    "error": f"Неподдерживаемый формат: {ext}",
+                    "status": "failed",
+                }
+            )
 
         except Exception as e:
             logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
-            results.append({
-                "file_id": None,
-                "filename": file.filename,
-                "error": str(e),
-                "chunks_created": 0,
-                "status": "failed",
-            })
+            results.append(
+                {
+                    "file_id": None,
+                    "filename": file.filename,
+                    "error": str(e),
+                    "chunks_created": 0,
+                    "status": "failed",
+                }
+            )
 
         finally:
+            # temp_path удаляем только если он ещё не был передан в ingest-директорию
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -399,56 +491,9 @@ async def upload_files(
                     pass
 
     # ============================================================
-    # Глобальный коммит
+    # Финальный ответ (глобальный commit уже не нужен — всё по месту)
     # ============================================================
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"❌ Ошибка общего коммита: {e}")
-
-    # ============================================================
-    # 7) Квалификация (логика не меняется)
-    # ============================================================
-    qualification_results = []
-
-    if case_ids_map:
-        for case_id, file_ids in case_ids_map.items():
-            try:
-                docs = get_file_docs_for_qualifier(db, file_ids=file_ids, case_id=case_id)
-                if not docs:
-                    continue
-
-                qualifier = qualify_documents(
-                    case_id=case_id,
-                    docs=docs,
-                    city="г. Павлодар",
-                    investigator_line="Следователь СЭР ДЭР по Павлодарской области",
-                )
-
-                verification = run_full_verification(qualifier)
-
-                qualification_results.append({
-                    "case_id": case_id,
-                    "files_analyzed": len(file_ids),
-                    "qualifier": qualifier,
-                    "verification": verification,
-                    "draft_postanovlenie": qualifier.get("final_postanovlenie"),
-                    "status": "success",
-                })
-
-            except Exception as e:
-                qualification_results.append({
-                    "case_id": case_id,
-                    "files_analyzed": len(file_ids),
-                    "error": str(e),
-                    "status": "failed",
-                })
-
-    # ============================================================
-    # 8) Финальный ответ
-    # ============================================================
-    successful_files = sum(1 for r in results if r["status"] == "success")
+    successful_files = sum(1 for r in results if r["status"] in ("success", "queued"))
     failed_files = sum(1 for r in results if r["status"] == "failed")
 
     return {
@@ -456,5 +501,5 @@ async def upload_files(
         "successful": successful_files,
         "failed": failed_files,
         "results": results,
-        "qualifications": qualification_results or None,
+        "case_ids": case_ids_map or None,
     }

@@ -9,12 +9,22 @@ from app.db.models import File, Chunk
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# 🔥 ИСПРАВЛЕННАЯ Retrieval 6.0 — ФОКУС НА КАЧЕСТВО
+# ============================================================
+
+# Не берём ВСЕ — берём только высокорелевантные
+TOP_K_WIDE = 200        # ← было 600! СЛИШКОМ МНОГО
+TOP_BASELINE_LIMIT = 150
+TOP_RERANK_INPUT = 80   # ← было 300, отправляем мало но качественно
+
 
 # ============================================================
-# 🔥 Нормализация текста (Kazakhstan legal safe)
+# 🔥 НОРМАЛИЗАЦИЯ (убираем мусор)
 # ============================================================
 
 def normalize_text(text: str) -> str:
+    """Убираем OCR мусор и техничку"""
     if not text:
         return ""
 
@@ -22,6 +32,7 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{2,}", "\n", text)
 
+    # Удаляем техмусор
     garbage = [
         r"©\s?Все права защищены",
         r"сканировано\s?с\s?помощью.*",
@@ -31,6 +42,8 @@ def normalize_text(text: str) -> str:
         r"электронный документ.*",
         r"Просмотрено.*",
         r"Дата печати.*",
+        r"хеш.*",
+        r"эцп.*",
     ]
 
     for g in garbage:
@@ -40,42 +53,43 @@ def normalize_text(text: str) -> str:
 
 
 # ============================================================
-# 🔥 Оценка чанка (baseline weight)
+# 🔥 CRISP baseline weight (ГЛАВНОЕ УЛУЧШЕНИЕ)
 # ============================================================
 
 def baseline_weight(filename: str, text: str) -> float:
+    """
+    Строгий baseline — НЕ берём мусор.
+    Только файлы с РЕАЛЬНЫМ содержанием.
+    """
     fn = filename.lower()
     t = text.lower()
 
-    # супер важные документы
-    strong = [
-        "рапорт", "куи", "ердр", "протокол_допроса_подозреваем",
-        "протокол допроса подозреваем",
-    ]
-    medium = [
-        "протокол_допроса_потерпевшего",
-        "протокол_допроса_потерпевш",
-        "постановление о признании лица потерпевшим",
-        "постановление о признании лица гражданским истцом",
-    ]
+    # VERY STRONG — допросы подозреваемого (THE GOLD)
+    if any(x in fn for x in ["протокол_допроса_подозреваем", "допроса подозреваем", "куи"]):
+        return 0.99
 
-    if any(x in fn for x in strong):
-        return 1.0
+    # STRONG — рапорты, ердр
+    if any(x in fn for x in ["рапорт", "ердр", "постановление о возбуждении"]):
+        return 0.90
 
-    if any(x in t for x in ["он подозревается", "она подозревается"]):
-        return 0.95
+    # MEDIUM — допросы потерпевших, свидетелей
+    if any(x in fn for x in ["допроса_потерпевш", "допроса потерпевш", "свидетелей"]):
+        return 0.75
 
-    if any(x in fn for x in medium):
-        return 0.80
-
+    # WEAK — просто постановления
     if "постановление" in fn:
-        return 0.70
+        return 0.60
 
-    return 0.40
+    # GARBAGE — файлы содержат только техмусор
+    if len(t) < 50 or t.count(" ") < 5:
+        return 0.0
+
+    # DEFAULT — остальное с малым весом
+    return 0.35
 
 
 # ============================================================
-# 🔥 Retrieval 4.0 — главный
+# 🔥 ГЛАВНЫЙ RETRIEVAL (исправленный)
 # ============================================================
 
 def get_file_docs_for_qualifier(
@@ -83,6 +97,9 @@ def get_file_docs_for_qualifier(
     file_ids: Optional[List[str]] = None,
     case_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """
+    Retrieval 6.0 — жёсткая фильтрация, НО качественная выборка.
+    """
 
     query = db.query(File)
 
@@ -93,12 +110,22 @@ def get_file_docs_for_qualifier(
         query = query.filter(File.file_id.in_(file_ids))
 
     files = query.all()
-    logger.info(f"📄 Retrieval: найдено файлов = {len(files)}")
+    logger.info(f"📄 Retrieval 6.0: всего файлов = {len(files)}")
 
     docs: List[Dict[str, Any]] = []
 
+    # ============================================================
+    # Читаем ТОЛЬКО релевантные чанки
+    # ============================================================
     for f in files:
         file_id = str(f.file_id)
+        filename = (f.filename or "").lower()
+
+        # 🔴 ФИЛЬТР 1: пропускаем файлы которые явно мусор
+        weight = baseline_weight(filename, "")
+        if weight < 0.30:
+            logger.debug(f"⏭️ Пропуск: {filename} (weight={weight})")
+            continue
 
         try:
             chunks = (
@@ -107,27 +134,34 @@ def get_file_docs_for_qualifier(
                 .order_by(
                     Chunk.page.asc(),
                     Chunk.start_offset.asc(),
-                    Chunk.created_at.asc(),
-                    Chunk.chunk_id.asc(),
                 )
                 .all()
             )
         except Exception as e:
-            logger.error(f"❌ Ошибка получения чанков файла {file_id}: {e}")
+            logger.error(f"❌ Ошибка чанков {file_id}: {e}")
             continue
 
         if not chunks:
             continue
 
+        # 🔴 ФИЛЬТР 2: пропускаем пустые и мусорные чанки
         for ch in chunks:
-            raw_text = (ch.text or "").strip()
-            if not raw_text:
+            raw = (ch.text or "").strip()
+            
+            # Слишком коротко?
+            if len(raw) < 30:
+                continue
+            
+            # Только служебная инфо?
+            if raw.count(" ") < 3:
                 continue
 
-            clean = normalize_text(raw_text)
-            if not clean:
+            clean = normalize_text(raw)
+            
+            if not clean or len(clean) < 20:
                 continue
 
+            # ✅ Добавляем только хорошие чанки
             docs.append({
                 "file_id": file_id,
                 "filename": f.filename,
@@ -136,19 +170,60 @@ def get_file_docs_for_qualifier(
                 "text": clean,
             })
 
-    # ===========================================================
-    # 🔥 BASELINE сортировка по важности документа
-    # ===========================================================
+    logger.info(f"📦 После фильтра: {len(docs)} чанков")
+
+    if not docs:
+        return []
+
+    # ============================================================
+    # Baseline сортировка
+    # ============================================================
     for d in docs:
         d["baseline_weight"] = baseline_weight(
             filename=d["filename"],
-            text=d["text"]
+            text=d["text"],
         )
 
+    # 🔴 ЖЁСТКАЯ СОРТИРОВКА
     docs = sorted(docs, key=lambda x: x["baseline_weight"], reverse=True)
+    docs = docs[:TOP_BASELINE_LIMIT]
 
-    # Ограничение — не более 400 чанков
-    docs = docs[:400]
+    logger.info(f"✅ Retrieval 6.0: передаём {min(len(docs), TOP_RERANK_INPUT)} документов в reranker")
 
-    logger.info(f"📦 Retrieval 4.0 вернул документов: {len(docs)}")
-    return docs
+    return docs[:TOP_RERANK_INPUT]
+
+
+# ============================================================
+# 🔍 DEBUG SEARCH (без изменений)
+# ============================================================
+
+def search_chunks(db: Session, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Упрощённый поиск для debug API."""
+
+    if not query or not query.strip():
+        return []
+
+    pattern = f"%{query.strip()}%"
+
+    try:
+        chunks = (
+            db.query(Chunk)
+            .filter(Chunk.text.ilike(pattern))
+            .order_by(Chunk.page.asc())
+            .limit(limit)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"[search_chunks ERROR] {e}")
+        return []
+
+    results = []
+    for ch in chunks:
+        results.append({
+            "file_id": str(ch.file_id),
+            "chunk_id": str(ch.chunk_id),
+            "page": ch.page,
+            "text": ch.text[:300] + ("..." if len(ch.text) > 300 else "")
+        })
+
+    return results
