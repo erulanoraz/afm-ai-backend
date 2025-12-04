@@ -8,7 +8,8 @@ from app.services.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-TOP_RERANK_OUTPUT = 50  # ← было 120, теперь меньше но качественнее
+# немного расширяем выход, чтобы не душить coverage
+TOP_RERANK_OUTPUT = 80  # было 50
 
 
 class LLMReranker:
@@ -65,12 +66,12 @@ class LLMReranker:
             return []
 
         cleaned_items: List[Dict[str, Any]] = []
-        
+
         for it in items:
             text = it.get("text") or ""
             if len(text) < 20:
                 continue
-            
+
             doc = dict(it)
             doc["clean_text"] = text[:500]  # ограничиваем длину
             cleaned_items.append(doc)
@@ -111,16 +112,40 @@ class LLMReranker:
         llm_scores = [0.0] * len(cleaned_items)
 
         try:
-            resp = self.llm.chat([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ])
+            raw_resp = self.llm.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+            )
+
+            if not raw_resp:
+                raise ValueError("Empty LLM response")
+
+            # Поддержка dict-ответа (OpenAI-стиль)
+            if isinstance(raw_resp, dict):
+                try:
+                    resp_text = (
+                        raw_resp.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+                except Exception:
+                    resp_text = ""
+                if not resp_text:
+                    resp_text = str(raw_resp)
+            else:
+                resp_text = str(raw_resp)
+
+            resp_text = resp_text.strip()
+            if not resp_text:
+                raise ValueError("Empty text in LLM response")
 
             # Вариант 1: чистый JSON массив
             try:
-                parsed = json.loads(resp.strip())
+                parsed = json.loads(resp_text)
                 if isinstance(parsed, list):
-                    for i, val in enumerate(parsed[:len(cleaned_items)]):
+                    for i, val in enumerate(parsed[: len(cleaned_items)]):
                         if isinstance(val, (int, float)):
                             llm_scores[i] = float(val)
             except json.JSONDecodeError:
@@ -128,12 +153,12 @@ class LLMReranker:
 
             # Вариант 2: JSON в строке
             if llm_scores == [0.0] * len(cleaned_items):
-                match = re.search(r"\[[\d\.,\s]+\]", resp)
+                match = re.search(r"\[[\d\.,\s]+\]", resp_text)
                 if match:
                     try:
                         parsed = json.loads(match.group(0))
                         if isinstance(parsed, list):
-                            for i, val in enumerate(parsed[:len(cleaned_items)]):
+                            for i, val in enumerate(parsed[: len(cleaned_items)]):
                                 if isinstance(val, (int, float)):
                                     llm_scores[i] = float(val)
                     except json.JSONDecodeError:
@@ -141,8 +166,8 @@ class LLMReranker:
 
             # Вариант 3: Regex вытаскиваем числа
             if llm_scores == [0.0] * len(cleaned_items):
-                nums = re.findall(r"0?\.\d+", resp)
-                for i, num_str in enumerate(nums[:len(cleaned_items)]):
+                nums = re.findall(r"0?\.\d+", resp_text)
+                for i, num_str in enumerate(nums[: len(cleaned_items)]):
                     try:
                         llm_scores[i] = float(num_str)
                     except ValueError:
@@ -151,7 +176,7 @@ class LLMReranker:
             logger.info(f"✅ Reranker: LLM оценки = {llm_scores}")
 
         except Exception as e:
-            logger.error(f"⚠️ LLM error: {e}, используем baseline")
+            logger.error(f"⚠️ LLM error в reranker: {e}, используем только baseline")
 
         # 5) Комбинируем baseline + LLM
         for d, llm_s in zip(cleaned_items, llm_scores):
@@ -160,7 +185,13 @@ class LLMReranker:
             d["cross_score"] = baseline_s * 0.4 + llm_s * 0.6
 
         # 6) Сортировка
-        sorted_items = sorted(cleaned_items, key=lambda d: d["cross_score"], reverse=True)
+        sorted_items = sorted(
+            cleaned_items,
+            key=lambda d: d["cross_score"],
+            reverse=True,
+        )
 
-        logger.info(f"📊 Reranker output: {len(sorted_items[:TOP_RERANK_OUTPUT])} документов")
+        logger.info(
+            f"📊 Reranker output: {len(sorted_items[:TOP_RERANK_OUTPUT])} документов"
+        )
         return sorted_items[:TOP_RERANK_OUTPUT]

@@ -1,10 +1,9 @@
-# app/services/vector_client.py 5.0 (Weaviate 2.x Evidence Engine)
+# app/search/vector_client.py
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import weaviate
-from weaviate.exceptions import WeaviateBaseError
 
 from app.utils.config import settings
 
@@ -22,48 +21,42 @@ def get_vector_client() -> "VectorClient":
 
 class VectorClient:
     """
-    Evidence Engine v5 — обновлённый клиент Weaviate (API 2.x):
-    ✔ client.collections
-    ✔ .data.insert / .data.update
-    ✔ batch = client.batch.dynamic
-    ✔ properties вместо "data"
-    ✔ корректный schema ensure
+    Vector Client 6.1 — стабильная версия
+    Работает с Weaviate 1.25.8, text2vec-transformers
     """
 
     def __init__(self, url: str):
-        self.client = weaviate.Client(url)
-        logger.info(f"🔗 VectorClient подключён к {url}")
+
+        # КЛЮЧЕВОЙ ФИКС:
+        # отключить OIDC/ADMINLIST чтобы клиент не пытался получить openid-config
+        self.client = weaviate.Client(
+            url=url,
+            auth_client_secret=None,
+            additional_headers={},
+            timeout_config=(5, 20),
+        )
+
+        logger.info(f"🔗 Weaviate client подключен к {url}")
+
         self.ensure_schema()
         self._configure_batch()
 
-    # --------------------------------------------------------------------
-    # Batch-config
-    # --------------------------------------------------------------------
-    def _configure_batch(self):
-        try:
-            self.client.batch.configure(
-                batch_size=200,
-                dynamic=True,
-                timeout_retries=3,
-            )
-            logger.info("⚙ Batch вставка Weaviate настроена.")
-        except Exception as e:
-            logger.error(f"❌ Ошибка batch config: {e}")
+    # ===================================================================================
+    # SCHEMA
+    # ===================================================================================
 
-    # --------------------------------------------------------------------
-    # Schema ensure
-    # --------------------------------------------------------------------
-    def ensure_schema(self):
+    def ensure_schema(self) -> None:
         try:
             schema = self.client.schema.get()
             classes = [c["class"] for c in schema.get("classes", [])]
 
             if "Chunk" in classes:
+                logger.info("✔ Schema 'Chunk' уже есть")
                 return
 
-            logger.warning("⚠ Schema Chunk отсутствует → создаём.")
+            logger.warning("⚠ Schema 'Chunk' отсутствует → создаём")
 
-            schema = {
+            chunk_class = {
                 "class": "Chunk",
                 "description": "Legal evidence chunk",
                 "properties": [
@@ -75,84 +68,80 @@ class VectorClient:
                 "vectorizer": "text2vec-transformers",
             }
 
-            self.client.schema.create_class(schema)
-            logger.info("✔ Schema Chunk создана.")
+            self.client.schema.create_class(chunk_class)
+            logger.info("✔ Schema 'Chunk' создана")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка создания schema Chunk: {e}")
+            logger.error(f"❌ Ошибка при создании схемы Chunk: {e}")
 
-    # --------------------------------------------------------------------
-    # Batch INSERT (новый формат)
-    # --------------------------------------------------------------------
-    def batch_insert_chunk(
-        self,
-        text: str,
-        file_id: str,
-        page: int,
-        chunk_id: str,
-    ) -> bool:
+    # ===================================================================================
+    # BATCH
+    # ===================================================================================
 
+    def _configure_batch(self) -> None:
+        try:
+            self.client.batch.configure(
+                batch_size=100,
+                dynamic=True,
+                timeout_retries=3,
+            )
+            logger.info("⚙ Batch режим включён")
+        except Exception as e:
+            logger.error(f"❌ Batch config error: {e}")
+
+    def batch_insert_chunk(self, text: str, file_id: str, page: int, chunk_id: str) -> bool:
         try:
             self.client.batch.add_data_object(
-                class_name="Chunk",
-                properties={
+                data_object={
                     "file_id": file_id,
                     "page": page,
                     "chunk_id": chunk_id,
                     "text": text,
-                }
+                },
+                class_name="Chunk",
+                uuid=str(chunk_id),
             )
             return True
 
         except Exception as e:
-            logger.error(f"[batch_insert_chunk] Ошибка: {e}")
+            logger.error(f"❌ batch_insert_chunk({chunk_id}) error: {e}")
             return False
 
-    # --------------------------------------------------------------------
-    # Flush
-    # --------------------------------------------------------------------
     def flush(self) -> bool:
         try:
             self.client.batch.flush()
             return True
         except Exception as e:
-            logger.error(f"[flush] Ошибка: {e}")
+            logger.error(f"❌ flush error: {e}")
             return False
 
-    # --------------------------------------------------------------------
-    # Single INSERT (новый формат)
-    # --------------------------------------------------------------------
-    def insert_chunk(self, text: str, file_id: str, page: int, chunk_id: str) -> bool:
-        """
-        Fallback — одиночная вставка, используется если batch не сработал.
-        """
+    # ===================================================================================
+    # SINGLE INSERT
+    # ===================================================================================
 
+    def insert_chunk(self, text: str, file_id: str, page: int, chunk_id: str) -> bool:
         try:
             self.client.data_object.create(
-                class_name="Chunk",
-                properties={
+                data_object={
                     "file_id": file_id,
                     "page": page,
                     "chunk_id": chunk_id,
                     "text": text,
-                }
+                },
+                class_name="Chunk",
+                uuid=str(chunk_id),
             )
             return True
 
         except Exception as e:
-            logger.error(f"[insert_chunk] Ошибка: {e}")
+            logger.error(f"❌ insert_chunk({chunk_id}) error: {e}")
             return False
 
-    # --------------------------------------------------------------------
-    # Search
-    # --------------------------------------------------------------------
-    def search(
-        self,
-        query_text: str,
-        limit: int = 10,
-        with_vector: bool = False,
-    ) -> Dict[str, Any]:
+    # ===================================================================================
+    # SEARCH
+    # ===================================================================================
 
+    def search(self, query_text: str, limit: int = 10, with_vector: bool = False) -> Dict[str, Any]:
         try:
             q = (
                 self.client.query
@@ -164,8 +153,9 @@ class VectorClient:
             if with_vector:
                 q = q.with_additional(["vector", "distance"])
 
-            return q.do()
+            result = q.do()
+            return result
 
         except Exception as e:
-            logger.error(f"[search] Ошибка Weaviate: {e}")
+            logger.error(f"❌ search error: {e}")
             return {}

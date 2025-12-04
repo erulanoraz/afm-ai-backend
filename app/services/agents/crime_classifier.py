@@ -1,7 +1,5 @@
-"""
-Crime Classifier 4.0 — классификация состава преступления по LegalFact (FactToken групповая модель)
-Работает ТОЛЬКО по LegalFact, где каждый факт состоит из набора FactToken.
-"""
+# Crime Classifier v6.0 UNIVERSAL
+# Равномерная, честная классификация по фактам, без приоритета конкретных статей.
 
 from typing import List, Dict, Any, Optional
 from app.services.facts.fact_models import LegalFact, FactToken
@@ -9,234 +7,210 @@ from app.services.agents.ai_laws import ALL_AFM_LAWS
 
 
 # ============================================================
-# 🔹 Кандидаты статей
+# Доступные статьи
 # ============================================================
 
 ARTICLE_CANDIDATES = [
-    "189",
-    "190",
-    "214",
-    "216",
-    "217",
-    "218",
-    "301-1",
+    "189", "190", "214", "216", "217", "218", "301-1"
 ]
 
 VALID_ARTICLES = [a for a in ARTICLE_CANDIDATES if a in ALL_AFM_LAWS]
 
 
 # ============================================================
-# 🔹 Ключевые слова
+# Ключевые сигналы — мягкие и равномерные
 # ============================================================
 
 ARTICLE_KEYWORDS: Dict[str, Dict[str, list[str]]] = {
+
+    # Мошенничество
     "190": {
-        "core": ["мошеннич", "обман", "ввел в заблужден", "заблужден", "ложн"],
-        "context": ["интернет", "онлайн", "платформ", "сайт"],
+        "core": ["обман", "ввел в заблуждение", "заблужд", "ложн"],
+        "context": ["перевел", "отправил", "получил", "деньги"],
     },
+
+    # Присвоение/Растрата
     "189": {
-        "core": ["вверен", "растрата", "присво", "подотчет", "материально ответ"],
-        "context": ["имущество было передано"],
+        "core": ["присвоил", "присвоила", "вверен", "растрата"],
+        "context": ["имущество", "доверено"],
     },
+
+    # Незаконная предпринимательская деятельность
     "214": {
-        "core": ["без регистрации", "без лицензии", "незаконная предприним"],
-        "context": ["получение дохода", "подакциз"],
+        "core": ["незаконная предприним", "без регистрации", "без лиценз"],
+        "context": ["доход", "товары", "деятельность"],
     },
+
+    # Лжепредпринимательство
     "216": {
-        "core": ["счет-фактур", "фиктив", "без фактического"],
-        "context": ["обналич", "наличн"],
+        "core": ["фиктив", "лжепредприят", "подставн"],
+        "context": ["счет-фактура", "обналич"],
     },
+
+    # Финансовая пирамида
     "217": {
-        "core": ["финансовая пирамида", "инвестиционная пирамида", "пирамида"],
-        "context": ["вклад", "вложен", "инвестиц"],
+        "core": ["финансовая пирамида", "пирамида", "инвестиц", "рефераль"],
+        "context": ["вклад", "проценты", "дивиденды", "вложил"],
     },
+
+    # Легализация доходов
     "218": {
         "core": ["легализац", "отмыван", "скрыть происхождение"],
-        "context": ["подставные лица", "финансовый поток"],
+        "context": ["финансовый поток", "перевод средств", "подставные"],
     },
+
+    # Вейпы / электронные сигареты
     "301-1": {
-        "core": ["вейп", "электронн сигарет", "некурительн табач"],
-        "context": ["продажа", "оптовая партия"],
+        "core": ["вейп", "электронн сигарет", "никотин"],
+        "context": ["реализация", "продажа"],
     },
 }
 
 
+
 # ============================================================
-# 🔹 Утилиты
+# Вспомогательные функции
 # ============================================================
 
-def _safe_lower(x: Optional[str]) -> str:
-    return (x or "").lower()
+def _text(fact: LegalFact) -> str:
+    tokens = " ".join((t.value or "").lower() for t in fact.tokens)
+    return (fact.text or "").lower() + " " + tokens
 
 
-def _fact_text(fact: LegalFact) -> str:
-    """
-    Создаёт текст факта — объединённый текст всех FactToken.value
-    """
-    return " ".join(t.value for t in fact.tokens if t.value).lower()
+def _has_amount(f: LegalFact) -> bool:
+    return any(t.type == "amount" for t in f.tokens)
 
 
-def _get_amounts(fact: LegalFact) -> List[str]:
-    return [t.value for t in fact.tokens if t.type == "amount"]
+def _has_transfer_tokens(f: LegalFact) -> bool:
+    return any(t.type in ("digital_transfer", "account", "channel") for t in f.tokens)
 
 
-def _get_actions(fact: LegalFact) -> List[str]:
-    return [t.value for t in fact.tokens if t.type == "action"]
+def _safe_lower(s: Optional[str]) -> str:
+    return (s or "").lower()
 
 
-def _score_article_for_token(article_id: str, fact: LegalFact) -> Dict[str, Any]:
-    """
-    Считает score для ОДНОГО LegalFact по ОДНОЙ статье.
-    """
-    text = _fact_text(fact)
 
-    keywords = ARTICLE_KEYWORDS.get(article_id, {})
-    core_kws = keywords.get("core", [])
-    ctx_kws = keywords.get("context", [])
+# ============================================================
+# Базовое взвешивание признаков
+# ============================================================
+
+def _score_article(article: str, fact: LegalFact) -> Dict[str, Any]:
+    text = _text(fact)
 
     score = 0.0
-    reasons: list[str] = []
+    reasons = []
 
-    # 1) Ключевые слова
-    for kw in core_kws:
-        if kw in text:
-            score += 1.5
-            reasons.append(f"core_keyword: {kw}")
+    cfg = ARTICLE_KEYWORDS.get(article, {})
+    core_kw = cfg.get("core", [])
+    ctx_kw = cfg.get("context", [])
 
-    for kw in ctx_kws:
-        if kw in text:
-            score += 0.5
-            reasons.append(f"context_keyword: {kw}")
+    # --- Основные сигналы ---
+    for w in core_kw:
+        if w in text:
+            score += 1.6
+            reasons.append(f"core keyword: {w}")
 
-    # 2) Суммы усиливают экономические статьи
-    if _get_amounts(fact) and article_id in ["189", "190", "214", "216", "217", "218", "301-1"]:
+    # --- Контекст ---
+    for w in ctx_kw:
+        if w in text:
+            score += 0.7
+            reasons.append(f"context keyword: {w}")
+
+    # --- Суммы ---
+    if _has_amount(fact):
+        score += 0.6
+        reasons.append("amount: деньги")
+
+    # --- Переводы ---
+    if _has_transfer_tokens(fact):
         score += 0.5
-        reasons.append("amount: есть сумма")
-
-    # 3) Действия (пример для мошенничества)
-    actions = _get_actions(fact)
-    if article_id == "190":
-        if any("обман" in _safe_lower(a) for a in actions):
-            score += 1.0
-            reasons.append("action: признаки обмана")
-
-    # 4) Роль факта
-    if fact.role:
-        r = fact.role.lower()
-        if article_id == "190" and "suspect" in r:
-            score += 0.5
-            reasons.append("role: подозреваемый")
-        if article_id == "189" and "respons" in r:
-            score += 1.0
-            reasons.append("role: ответственное лицо")
+        reasons.append("transfer: перевод средств")
 
     return {"score": score, "reasons": reasons}
 
 
+
 # ============================================================
-# 🔹 Главная функция классификации
+# Главная функция классификации
 # ============================================================
 
 def classify_by_tokens(facts: List[LegalFact]) -> Dict[str, Any]:
-    """
-    Вход:
-        facts: List[LegalFact]
 
-    Выход:
-        {
-            "primary": "190" | "217" | ... | None,
-            "secondary": ["214", "218"],
-            "scores": {
-                "190": {"score": 5.0, "reasons": [...]},
-                ...
-            }
-        }
-    """
-    result: Dict[str, Any] = {
+    result = {
         "primary": None,
         "secondary": [],
-        "scores": {},
+        "scores": {}
     }
 
     if not facts:
         return result
 
-    scores: Dict[str, float] = {a: 0.0 for a in VALID_ARTICLES}
-    reasons_map: Dict[str, List[str]] = {a: [] for a in VALID_ARTICLES}
+    # Суммарные баллы
+    scores = {a: 0.0 for a in VALID_ARTICLES}
+    reasons_map = {a: [] for a in VALID_ARTICLES}
 
-    # Обрабатываем каждый факт
-    for idx, f in enumerate(facts, start=1):
-        # красивый id для логов: либо fact_id, либо fact_N
-        fact_label = getattr(f, "fact_id", None) or f"fact_{idx}"
+    # Проходим по фактам
+    for f_idx, fact in enumerate(facts, start=1):
+        fact_id = getattr(fact, "fact_id", f"fact_{f_idx}")
 
         for art in VALID_ARTICLES:
-            res = _score_article_for_token(art, f)
-            if res["score"] > 0:
-                scores[art] += res["score"]
-                reasons_map[art].extend(
-                    [f"[{fact_label}] {msg}" for msg in res["reasons"]]
-                )
+            sc = _score_article(art, fact)
+            if sc["score"] > 0:
+                scores[art] += sc["score"]
+                for r in sc["reasons"]:
+                    reasons_map[art].append(f"[{fact_id}] {r}")
 
-    # Сохраняем score по статьям
+    # Сохраняем
     for art in VALID_ARTICLES:
         result["scores"][art] = {
             "score": round(scores[art], 3),
             "reasons": reasons_map[art],
         }
 
-    # Пороги
+    # Пороги мягкие и честные
     THRESH_PRIMARY = 3.0
-    THRESH_SECONDARY = 2.0
+    THRESH_SECONDARY = 1.8
 
-    # Primary — максимальный score
-    primary: Optional[str] = None
-    max_score = 0.0
-    for art, sc in scores.items():
-        if sc > max_score:
-            max_score = sc
-            primary = art
-
-    if primary and max_score >= THRESH_PRIMARY:
+    # Primary — статья с максимальным score
+    primary = max(scores, key=lambda a: scores[a])
+    if scores[primary] >= THRESH_PRIMARY:
         result["primary"] = primary
     else:
-        primary = None
+        result["primary"] = None
 
-    # Secondary — все, кто ≥ THRESH_SECONDARY и не primary
-    secondary: list[str] = []
-    for art, sc in scores.items():
-        if art == primary:
-            continue
-        if sc >= THRESH_SECONDARY:
-            secondary.append(art)
-
+    # Secondary — все статьи, которые имеют вес
+    secondary = [
+        art for art, sc in scores.items()
+        if art != primary and sc >= THRESH_SECONDARY
+    ]
     result["secondary"] = secondary
 
     return result
 
 
+
 # ============================================================
-# 🔹 Форматирование для логов
+# Форматированный вывод для логов
 # ============================================================
 
 def format_classification_debug(classification: Dict[str, Any]) -> str:
-    lines: List[str] = []
+
+    lines = []
 
     primary = classification.get("primary")
-    secondary = classification.get("secondary", [])
-    scores = classification.get("scores", {})
+    secondaries = classification.get("secondary", [])
 
     lines.append(f"PRIMARY: {primary or 'не определена'}")
-    if secondary:
-        lines.append(f"SECONDARY: {', '.join(secondary)}")
+
+    if secondaries:
+        lines.append("SECONDARY: " + ", ".join(secondaries))
     else:
         lines.append("SECONDARY: —")
 
-    for art, data in scores.items():
-        sc = data.get("score", 0.0)
-        if sc <= 0:
-            continue
-        lines.append(f"\nСтатья {art}: score={sc}")
-        for r in data.get("reasons", [])[:5]:
-            lines.append(f"  • {r}")
+    for art, d in classification["scores"].items():
+        if d["score"] > 0:
+            lines.append(f"\nСтатья {art}: score={d['score']}")
+            for r in d["reasons"][:6]:
+                lines.append(f"  • {r}")
 
     return "\n".join(lines)

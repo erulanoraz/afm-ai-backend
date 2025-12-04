@@ -1,5 +1,5 @@
 # =====================================================================
-# 📦 Chunker 7.0 — PostgreSQL-only (no Weaviate)
+# 📦 Chunker 7.1 — PostgreSQL-only (no Weaviate), SentenceSplitter v15
 # =====================================================================
 
 import os
@@ -10,19 +10,17 @@ from typing import Optional, List, Dict, Any
 
 from sqlalchemy.orm import Session
 from PyPDF2 import PdfReader
-from pdf2image import convert_from_path
 from transformers import GPT2TokenizerFast
 
 from app.db.models import Chunk
 from app.services.ocr_worker import (
     extract_text_from_pdf,
     run_tesseract_ocr,
-    run_tesseract_ocr_image,
 )
 from app.services.parser import extract_text_from_file
 from app.utils.config import settings
 from app.tasks.vector_tasks import enqueue_chunk_vectorization
-
+from app.utils.sentence_splitter import split_into_sentences  # v15.0
 
 logger = logging.getLogger("CHUNKER7")
 
@@ -36,6 +34,7 @@ def ensure_uuid(value) -> Optional[uuid.UUID]:
     except Exception:
         logger.error(f"❌ Некорректный UUID: {value}")
         return None
+
 
 # =====================================================================
 # 🔧 Normalization
@@ -63,6 +62,7 @@ def _normalize_text(text: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
+
 # =====================================================================
 # 🔎 Detect section
 # =====================================================================
@@ -75,6 +75,7 @@ SECTION_PATTERNS = {
     "prilojenie": r"(ПРИЛОЖЕНИЕ|Приложение)",
 }
 
+
 def detect_section(text: str) -> str:
     if not text:
         return "unknown"
@@ -83,19 +84,23 @@ def detect_section(text: str) -> str:
             return section
     return "unknown"
 
+
 # =====================================================================
 # 🧠 Evidence extraction layer
 # =====================================================================
 
+# ВАЖНО: этот split_sentences — тонкая обёртка над SentenceSplitter v15,
+# чтобы не ломать старый интерфейс и зависимости.
+
 def split_sentences(text: str) -> List[str]:
     if not text:
         return []
-    t = text.replace("\r", " ").replace("\n", " ")
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[А-ЯA-Z])", t) if s.strip()]
+    return split_into_sentences(text)
+
 
 def build_slg_groups(sentences: List[str]) -> List[List[str]]:
-    groups = []
-    current = []
+    groups: List[List[str]] = []
+    current: List[str] = []
 
     def flush():
         nonlocal current
@@ -124,6 +129,7 @@ def build_slg_groups(sentences: List[str]) -> List[List[str]]:
         flush()
 
     return groups or ([sentences] if sentences else [])
+
 
 def extract_entities(text: str) -> Dict[str, List[str]]:
     if not text:
@@ -160,6 +166,7 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
         ),
     }
 
+
 EVENT_MAP = {
     "transfer": r"(перевел|перевела|перечислил|перечислила|оплатил|оплатила|перевод средств)",
     "withdrawal": r"(вывел|вывела|снял|сняла|обналичил|обналичила)",
@@ -167,11 +174,13 @@ EVENT_MAP = {
     "fraud": r"(обман|ввел в заблуждение|ввела в заблуждение|мошенничеств\w+)",
 }
 
+
 def extract_events(text: str) -> List[str]:
     if not text:
         return []
     lowered = text.lower()
     return [event for event, pattern in EVENT_MAP.items() if re.search(pattern, lowered)]
+
 
 def extract_facts(text: str) -> Dict[str, Any]:
     if not text:
@@ -192,6 +201,7 @@ def extract_facts(text: str) -> Dict[str, Any]:
         "action": action,
     }
 
+
 def build_evidence_payload(chunk_text: str, page: int, section: str, paragraph_index: int):
     sentences = split_sentences(chunk_text)
     return {
@@ -206,22 +216,25 @@ def build_evidence_payload(chunk_text: str, page: int, section: str, paragraph_i
         "tokens_count": len(chunk_text.split()),
     }
 
+
 # =====================================================================
 # 🔥 Token-based chunker 7.0
 # =====================================================================
 
 gpt_tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
+
 def count_tokens(text: str) -> int:
     return len(gpt_tokenizer.encode(text)) if text else 0
+
 
 def _split_long_sentence_by_tokens(sentence: str, max_tokens: int) -> List[str]:
     words = sentence.split()
     if not words:
         return []
 
-    chunks = []
-    buf = []
+    chunks: List[str] = []
+    buf: List[str] = []
     buf_tokens = 0
 
     for w in words:
@@ -236,6 +249,7 @@ def _split_long_sentence_by_tokens(sentence: str, max_tokens: int) -> List[str]:
         chunks.append(" ".join(buf))
 
     return chunks
+
 
 def advanced_page_chunker(
     page_text: str,
@@ -254,8 +268,8 @@ def advanced_page_chunker(
         tok = count_tokens(text)
         return [{"start": 0, "end": len(text), "text": text, "tokens": tok}]
 
-    chunks = []
-    cur_sentences = []
+    chunks: List[Dict[str, Any]] = []
+    cur_sentences: List[str] = []
     cur_tokens = 0
     global_offset = 0
 
@@ -267,7 +281,12 @@ def advanced_page_chunker(
         if chunk_text:
             tok = count_tokens(chunk_text)
             chunks.append(
-                {"start": global_offset, "end": global_offset + len(chunk_text), "text": chunk_text, "tokens": tok}
+                {
+                    "start": global_offset,
+                    "end": global_offset + len(chunk_text),
+                    "text": chunk_text,
+                    "tokens": tok,
+                }
             )
             global_offset += len(chunk_text) + 1
         cur_sentences, cur_tokens = [], 0
@@ -286,7 +305,14 @@ def advanced_page_chunker(
             parts = _split_long_sentence_by_tokens(s, max_tokens)
             for p in parts:
                 tok = count_tokens(p)
-                chunks.append({"start": global_offset, "end": global_offset + len(p), "text": p, "tokens": tok})
+                chunks.append(
+                    {
+                        "start": global_offset,
+                        "end": global_offset + len(p),
+                        "text": p,
+                        "tokens": tok,
+                    }
+                )
                 global_offset += len(p) + 1
             continue
 
@@ -311,6 +337,7 @@ def advanced_page_chunker(
 
     return chunks
 
+
 # =====================================================================
 # 📄 OCR + Chunker 7.0 (PDF)
 # =====================================================================
@@ -333,7 +360,11 @@ def process_pdf_with_smart_ocr(file_path: str, file_id, db: Session) -> int:
 
             if not text or len(text) < 50:
                 logger.info(f"[SMART OCR] стр {i}: мало текста → Tesseract")
-                text = run_tesseract_ocr(file_path=file_path, page_num=i, use_preprocessing=True) or ""
+                text = run_tesseract_ocr(
+                    file_path=file_path,
+                    page_num=i,
+                    use_preprocessing=True,
+                ) or ""
                 text = _normalize_text(text)
 
             if not text.strip():
@@ -345,7 +376,12 @@ def process_pdf_with_smart_ocr(file_path: str, file_id, db: Session) -> int:
 
             for idx, ch in enumerate(page_chunks, start=1):
                 chunk_text = ch["text"]
-                evidence = build_evidence_payload(chunk_text, page=i, section=section, paragraph_index=idx)
+                evidence = build_evidence_payload(
+                    chunk_text,
+                    page=i,
+                    section=section,
+                    paragraph_index=idx,
+                )
 
                 chunk = Chunk(
                     chunk_id=uuid.uuid4(),
@@ -369,6 +405,7 @@ def process_pdf_with_smart_ocr(file_path: str, file_id, db: Session) -> int:
     logger.info(f"SMART OCR 7.0 → создано чанков: {chunks_created}")
     return chunks_created
 
+
 # =====================================================================
 # 📄 Fallback OCR
 # =====================================================================
@@ -389,7 +426,12 @@ def process_pdf_with_ocr(file_path: str, file_id, db: Session) -> int:
 
     for idx, ch in enumerate(page_chunks, start=1):
         chunk_text = ch["text"]
-        evidence = build_evidence_payload(chunk_text, page=idx, section="unknown", paragraph_index=idx)
+        evidence = build_evidence_payload(
+            chunk_text,
+            page=idx,
+            section="unknown",
+            paragraph_index=idx,
+        )
 
         chunk = Chunk(
             chunk_id=uuid.uuid4(),
@@ -409,11 +451,18 @@ def process_pdf_with_ocr(file_path: str, file_id, db: Session) -> int:
     logger.info(f"📄 Fallback OCR 7.0: создано {chunks_created} чанков")
     return chunks_created
 
+
 # =====================================================================
 # 📑 DOCX/TXT
 # =====================================================================
 
-def process_text_into_chunks(file_id, text: str, db: Session, min_len: int = 50, page_start: int = 1) -> int:
+def process_text_into_chunks(
+    file_id,
+    text: str,
+    db: Session,
+    min_len: int = 50,
+    page_start: int = 1,
+) -> int:
     file_id = ensure_uuid(file_id)
     if not file_id:
         return 0
@@ -431,7 +480,12 @@ def process_text_into_chunks(file_id, text: str, db: Session, min_len: int = 50,
         if len(chunk_text) < min_len and len(page_chunks) > 1:
             continue
 
-        evidence = build_evidence_payload(chunk_text, page=idx, section="plain_text", paragraph_index=idx)
+        evidence = build_evidence_payload(
+            chunk_text,
+            page=idx,
+            section="plain_text",
+            paragraph_index=idx,
+        )
 
         chunk = Chunk(
             chunk_id=uuid.uuid4(),
@@ -451,6 +505,7 @@ def process_text_into_chunks(file_id, text: str, db: Session, min_len: int = 50,
     logger.info(f"process_text_into_chunks 7.0: {chunks_created} чанков")
     return chunks_created
 
+
 # =====================================================================
 # 📦 Entry point
 # =====================================================================
@@ -465,11 +520,13 @@ def process_any_file(file_path: str, file_id, db: Session) -> int:
     elif ext in [".docx", ".txt"]:
         text = extract_text_from_file(file_path) or ""
         if not text.strip():
-            text = extract_text_from_pdf(file_path, dpi=300) or ""
+            logger.warning(f"⚠️ Не удалось извлечь текст из {file_path} ({ext}), пропускаем.")
+            return 0
         return process_text_into_chunks(file_id, text, db)
 
     logger.warning(f"Unsupported file type: {ext}")
     return 0
+
 
 # =====================================================================
 # Router compatibility helpers
@@ -478,12 +535,14 @@ def process_any_file(file_path: str, file_id, db: Session) -> int:
 def sentence_splitting(text: str) -> List[str]:
     return split_sentences(text)
 
+
 def chunk_by_sentences(text: str, max_chars: int = 1500, min_chars: int = 300) -> List[str]:
     sents = split_sentences(text)
     if not sents:
         return [text]
 
-    chunks, buf = [], ""
+    chunks: List[str] = []
+    buf = ""
 
     for s in sents:
         if len(buf) + len(s) + 1 > max_chars:
@@ -500,5 +559,11 @@ def chunk_by_sentences(text: str, max_chars: int = 1500, min_chars: int = 300) -
 
     return chunks
 
-def build_chunk_payload(chunk_text: str, page: int, section: str = "debug", paragraph_index: int = 1):
+
+def build_chunk_payload(
+    chunk_text: str,
+    page: int,
+    section: str = "debug",
+    paragraph_index: int = 1,
+):
     return build_evidence_payload(chunk_text, page, section, paragraph_index)

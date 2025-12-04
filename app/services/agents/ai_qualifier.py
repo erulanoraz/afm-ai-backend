@@ -5,6 +5,7 @@ import logging
 import uuid
 import json
 import re
+from collections import Counter
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -30,7 +31,8 @@ logger = logging.getLogger(__name__)
 
 llm = LLMClient()
 
-MODEL_VERSION = "qualifier-llm-4.5.0"
+# ВЕРСИЮ ОБНОВИЛИ, ЧТОБЫ ВИДНО БЫЛО, ЧТО ЛОГИКА ПЕРЕРАБОТАНА
+MODEL_VERSION = "qualifier-llm-6.0.2"
 
 
 # ============================================================
@@ -71,7 +73,7 @@ def ask_llm(system_prompt: str, user_prompt: str) -> str:
 
 def safe_json_loads(raw: str) -> Optional[dict]:
     """
-    JSON Recovery Layer — AI_Qualifier 4.5
+    JSON Recovery Layer — AI_Qualifier 6.0+
     Исправляет частично сломанные JSON-структуры от LLM.
 
     Поддерживает:
@@ -109,7 +111,12 @@ def safe_json_loads(raw: str) -> Optional[dict]:
 
     # 6) первая попытка parse
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        # ожидаем dict; если LLM вернул массив с одним объектом — берём первый
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            return parsed[0]
+        if isinstance(parsed, dict):
+            return parsed
     except Exception:
         pass
 
@@ -151,7 +158,7 @@ def _extract_token_ids_from_fact(fact: LegalFact) -> List[str]:
                         token_ids.append(v)
         except Exception as e:
             logger.warning(
-                f"⚠ Не удалось извлечь token_ids из факта {getattr(fact, 'id', None)}: {e}"
+                f"⚠ Не удалось извлечь token_ids из факта {getattr('id', None)}: {e}"
             )
 
     # убираем дубликаты
@@ -229,6 +236,218 @@ def _validate_facts_for_llm(facts: List[LegalFact]) -> List[LegalFact]:
 
 
 # ============================================================
+# 🔧 Нормализация ФИО и имени проекта/организации
+# ============================================================
+
+def _normalize_person_name(name: str) -> str:
+    """
+    Унифицирует ФИО: убирает лишние пробелы, приводит к аккуратному виду.
+    Не лезет в логику пола/падежей — только формат.
+    """
+    if not name:
+        return ""
+    n = re.sub(r"\s+", " ", name).strip()
+    if not n:
+        return ""
+    parts = n.split(" ")
+    return " ".join(p[:1].upper() + p[1:] for p in parts)
+
+
+def _normalize_project_name(name: str) -> str:
+    """
+    Унифицирует название проекта/организации/платформы:
+    убирает кавычки, лишние пробелы, сохраняет общий вид.
+    """
+    if not name:
+        return ""
+    n = name.strip().strip("«»\"'“”„“")
+    n = re.sub(r"\s+", " ", n)
+    return n.strip()
+
+
+# ============================================================
+# 🔧 Сбор мета-информации по делу
+#      (suspects, victims, organizations, platforms, amounts)
+# ============================================================
+
+def _collect_case_meta(facts: List[LegalFact]) -> Dict[str, Any]:
+    """
+    Собирает метаданные дела на основе LegalFact:
+    - project_name
+    - suspects (ФИО)
+    - victims (ФИО)
+    - organizations (названия)
+    - platforms (названия)
+    - all_persons
+    - amounts_summary (min/max/total по числам из amount)
+    - participants_formatted (формат 2: «лицо, указанное в материалах как ...»)
+    """
+    suspects: set[str] = set()
+    victims: set[str] = set()
+    all_persons: set[str] = set()
+    organizations: set[str] = set()
+    platforms: set[str] = set()
+    project_candidates: List[str] = []
+    amount_values: List[int] = []
+
+    for f in facts:
+        txt_raw = getattr(f, "text", "") or ""
+        txt = txt_raw.lower()
+        tokens = getattr(f, "tokens", []) or []
+        role = (getattr(f, "role", "") or "").lower()
+
+        # role_label токены (victim/suspect/organizer/witness ...)
+        role_labels = {t.value for t in tokens if t.type == "role_label" and t.value}
+
+        # PERSONS
+        persons_in_fact = [t.value for t in tokens if t.type == "person" and t.value]
+        norm_persons: List[str] = []
+        for p in persons_in_fact:
+            n = _normalize_person_name(p)
+            if n:
+                norm_persons.append(n)
+                all_persons.add(n)
+
+        # Heuristics для подозреваемых
+        is_suspect_fact = False
+        if role in ("suspect_action", "fraud_action", "fraud_event"):
+            is_suspect_fact = True
+        if "подозреваем" in txt:
+            is_suspect_fact = True
+        if any("suspect" in str(lbl).lower() for lbl in role_labels):
+            is_suspect_fact = True
+
+        if is_suspect_fact:
+            for p in norm_persons:
+                suspects.add(p)
+
+        # Heuristics для потерпевших
+        is_victim_fact = False
+        if "потерпевш" in txt:
+            is_victim_fact = True
+        if any("victim" in str(lbl).lower() for lbl in role_labels):
+            is_victim_fact = True
+
+        if is_victim_fact:
+            for p in norm_persons:
+                victims.add(p)
+
+        # AMOUNTS
+        for t in tokens:
+            if t.type == "amount" and t.value:
+                digits = re.sub(r"[^\d]", "", t.value)
+                if digits:
+                    try:
+                        amount_values.append(int(digits))
+                    except Exception:
+                        pass
+
+        # ORGANIZATIONS / PROJECTS / PLATFORMS — через токены
+        for t in tokens:
+            t_type = getattr(t, "type", None)
+            t_val = getattr(t, "value", None) or ""
+            if not t_type or not t_val:
+                continue
+
+            if t_type in ("project", "project_name"):
+                name_norm = _normalize_project_name(t_val)
+                if name_norm:
+                    project_candidates.append(name_norm)
+
+            if t_type in ("organization", "company"):
+                name_norm = _normalize_project_name(t_val)
+                if name_norm:
+                    organizations.add(name_norm)
+                    project_candidates.append(name_norm)
+
+            if t_type == "platform":
+                name_norm = _normalize_project_name(t_val)
+                if name_norm:
+                    platforms.add(name_norm)
+
+        # ORGANIZATIONS — через текстовые шаблоны
+        for m in re.findall(
+            r"(проект|компания|организация)\s+«([^»]{2,80})»",
+            txt_raw,
+            flags=re.IGNORECASE,
+        ):
+            name_norm = _normalize_project_name(m[1])
+            if name_norm:
+                organizations.add(name_norm)
+                project_candidates.append(name_norm)
+
+        # PLATFORMS — через текстовые шаблоны
+        for m in re.findall(
+            r"(платформа|система)\s+«([^»]{2,80})»",
+            txt_raw,
+            flags=re.IGNORECASE,
+        ):
+            name_norm = _normalize_project_name(m[1])
+            if name_norm:
+                platforms.add(name_norm)
+
+    project_name = None
+    if project_candidates:
+        freq = Counter(project_candidates)
+        project_name = freq.most_common(1)[0][0]
+
+    amounts_summary = None
+    if amount_values:
+        try:
+            amounts_summary = {
+                "count": len(amount_values),
+                "min": min(amount_values),
+                "max": max(amount_values),
+                "total": sum(amount_values),
+            }
+        except Exception:
+            amounts_summary = {
+                "count": len(amount_values),
+            }
+
+    # Формат 2: юридически безопасные описания участников
+    participants_formatted: Dict[str, List[str]] = {}
+
+    if suspects:
+        participants_formatted["suspects"] = [
+            f"подозреваемый, указанный в материалах как {s}"
+            for s in sorted(suspects)
+        ]
+
+    if victims:
+        participants_formatted["victims"] = [
+            f"потерпевший, указанный в материалах как {v}"
+            for v in sorted(victims)
+        ]
+
+    if organizations:
+        participants_formatted["organizations"] = [
+            f"организация, фигурирующая в материалах как «{o}»"
+            for o in sorted(organizations)
+        ]
+
+    if platforms:
+        participants_formatted["platforms"] = [
+            f"платформа, обозначенная в материалах как «{p}»"
+            for p in sorted(platforms)
+        ]
+
+    meta: Dict[str, Any] = {
+        "project_name": project_name,
+        "suspects": sorted(suspects),
+        "victims": sorted(victims),
+        "organizations": sorted(organizations),
+        "platforms": sorted(platforms),
+        "victims_count": len(victims),
+        "all_persons": sorted(all_persons),
+        "amounts_summary": amounts_summary,
+        "participants_formatted": participants_formatted,
+    }
+
+    return meta
+
+
+# ============================================================
 # 🔧 Строгий sentence/token alignment поверх базового
 # ============================================================
 
@@ -256,13 +475,87 @@ def _strict_sentence_token_alignment(
 
 
 # ============================================================
+# 🔧 Очистка технических вставок (token-id, UUID и т.п.)
+# ============================================================
+
+_TECH_TOKEN_RE = re.compile(r"\(token [^)]+\)", re.IGNORECASE)
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_TOKEN_WORD_UUID_RE = re.compile(r"token\s+[0-9a-fA-F\-]{8,}", re.IGNORECASE)
+
+
+def _strip_technical_tokens(text: str) -> str:
+    """
+    Убирает из текста служебные конструкции:
+    • '(token XXXXX-...)'
+    • чистые UUID
+    • фразы вида 'token XXXXX-...'
+    Используется как защитный слой, чтобы в финальном документе
+    не было внутренних идентификаторов.
+    """
+    if not text:
+        return text
+
+    cleaned = _TECH_TOKEN_RE.sub("", text)
+    cleaned = _UUID_RE.sub("", cleaned)
+    cleaned = _TOKEN_WORD_UUID_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+# ============================================================
+# 🔍 Авто-определение города по текстам
+# ============================================================
+
+def _detect_city_from_docs(docs: List[dict]) -> str:
+    """
+    Очень мягкое определение города:
+    - ищем г. Алматы, Астана, Шымкент, Павлодар, Караганда, Костанай, Актау, Актобе и др.
+    - если нет — возвращаем пусто
+    """
+    if not docs:
+        return ""
+
+    cities = [
+        "Алматы",
+        "Астана",
+        "Нур-Султан",
+        "Шымкент",
+        "Павлодар",
+        "Караганда",
+        "Костанай",
+        "Актау",
+        "Актобе",
+        "Тараз",
+        "Усть-Каменогорск",
+        "Семей",
+        "Кокшетау",
+    ]
+
+    merged_text = " ".join((d.get("text") or "").lower() for d in docs)
+
+    for c in cities:
+        if c.lower() in merged_text:
+            return c
+
+    return ""
+
+
+def _count_words(text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
+# ============================================================
 # ⭐ Основная функция квалификации
 # ============================================================
 
 def qualify_documents(
-    case_id: str,
+    case_id: Optional[str],
     docs: List[Dict[str, Any]],
-    city: str = "г. Павлодар",
+    city: Optional[str] = None,
     investigator_fio: str = "Не указан",
     investigator_line: str = "Следователь",
     date_str: Optional[str] = None,
@@ -275,8 +568,17 @@ def qualify_documents(
         date_str = datetime.now().strftime("%d.%m.%Y")
 
     logger.info(
-        f"▶️ QUALIFIER 4.5 (token-json): case_id={case_id}, docs={len(docs)}"
+        f"▶️ QUALIFIER 6.0.2 (token-json): docs={len(docs)}, case_id={case_id or '-'}"
     )
+
+    # ------------------------------------------------------------
+    # 0) Автоматическое определение города
+    # ------------------------------------------------------------
+    auto_city = _detect_city_from_docs(docs)
+    if auto_city:
+        city = auto_city
+    else:
+        city = city or ""
 
     # =====================================================================
     # 1) Tokenizer
@@ -324,11 +626,27 @@ def qualify_documents(
         )
 
     # =====================================================================
-    # 3) RAG Router
+    # 2.2) Pre-crime classification (чисто диагностическая)
+    # =====================================================================
+    pre_cls_input = [f for f in filtered_facts if getattr(f, "role", "") != "generic_fact"]
+    if not pre_cls_input:
+        pre_cls_input = filtered_facts
+
+    pre_classification = classify_by_tokens(pre_cls_input)
+    logger.info(
+        "⚖ Pre-crime classification (для отладки):\n"
+        + format_classification_debug(pre_classification)
+    )
+
+    # =====================================================================
+    # 3) RAG Router (БЕЗ target_article — универсальный режим)
     # =====================================================================
     router = RAGRouter()
-    routed_facts: List[LegalFact] = router.route_for_qualifier(filtered_facts)
-    logger.info(f"📙 RAG Router: кандидатов до авто-чистки = {len(routed_facts)}")
+    routed_facts: List[LegalFact] = router.route_for_qualifier(
+        filtered_facts,
+        target_article=None,  # НЕ навязываем состав, роутер работает универсально
+    )
+    logger.info(f"📙 RAG Router: кандидатов (сырой вывод) = {len(routed_facts)}")
 
     if not routed_facts:
         return _empty_result(
@@ -342,8 +660,6 @@ def qualify_documents(
     routed_facts = _cleanup_routed_facts(routed_facts)
     routed_facts = _validate_facts_for_llm(routed_facts)
 
-    logger.info(f"📙 RAG Router: после авто-чистки = {len(routed_facts)}")
-
     if not routed_facts:
         return _empty_result(
             case_id,
@@ -352,35 +668,102 @@ def qualify_documents(
             investigator_line,
         )
 
+    # 3.2) Группировка по routing_group (primary / secondary / reserve)
+    primary_facts: List[LegalFact] = []
+    secondary_facts: List[LegalFact] = []
+    reserve_facts: List[LegalFact] = []
+
+    for f in routed_facts:
+        grp = getattr(f, "routing_group", None)
+        if grp == "secondary":
+            secondary_facts.append(f)
+        elif grp == "reserve":
+            reserve_facts.append(f)
+        else:
+            primary_facts.append(f)
+
+    routed_facts = primary_facts + secondary_facts + reserve_facts
+
+    logger.info(
+        "📙 RAG Router: группировка после авто-чистки → "
+        f"primary={len(primary_facts)}, "
+        f"secondary={len(secondary_facts)}, "
+        f"reserve={len(reserve_facts)}, "
+        f"total={len(routed_facts)}"
+    )
+
+    # 3.3) Сбор мета-информации по делу (project_name, suspects, victims, суммы, организации, платформы)
+    case_meta = _collect_case_meta(routed_facts)
+    logger.info(f"📌 Case meta: {case_meta}")
+
     # ============================================================
-    # 3.2) Crime Classification (по LegalFact)
+    # 3.4) Crime Classification (финальная, по routed_facts)
+    #      — чисто для auto_classification, НЕ навязываем LLM статьи
     # ============================================================
     cls_input = [f for f in routed_facts if getattr(f, "role", "") != "generic_fact"]
     if not cls_input:
         cls_input = routed_facts
 
     classification = classify_by_tokens(cls_input)
-    logger.info("⚖ Crime classification:\n" + format_classification_debug(classification))
+
+    logger.info(
+        "⚖ Crime classification (финальная по routed_facts):\n"
+        + format_classification_debug(classification)
+    )
 
     primary_article = classification.get("primary")
-    secondary_articles = classification.get("secondary", [])
+    secondary_articles = classification.get("secondary", []) or []
+
+    # Универсальный список всех выявленных статей (чтобы 217 НЕ выглядела «отдельно»)
+    articles_all: List[str] = []
+    if primary_article:
+        articles_all.append(primary_article)
+    for a in secondary_articles:
+        if a and a not in articles_all:
+            articles_all.append(a)
+
+    logger.info(
+        f"⚖ Итоговая авто-классификация: primary={primary_article}, "
+        f"secondary={secondary_articles}, all={articles_all}"
+    )
 
     # =====================================================================
-    # 4) Подготовка payload фактов для LLM (JSON strict)
+    # 4) Подготовка payload фактов для LLM (JSON strict, с группами)
     # =====================================================================
     facts_payload: List[Dict[str, Any]] = []
     for f in routed_facts:
         d = f.model_dump()
+
         # для верификатора: гарантируем поле sources, даже если модель называет его иначе
         if "sources" not in d and "source_refs" in d:
             d["sources"] = d.get("source_refs") or []
+
+        # помечаем routing_group, если он есть у факта
+        grp = getattr(f, "routing_group", None)
+        if grp:
+            d["routing_group"] = grp
+
         facts_payload.append(d)
+
+    logger.info(
+        f"📊 Facts payload для LLM: всего={len(facts_payload)}, "
+        f"primary≈{sum(1 for x in facts_payload if x.get('routing_group') == 'primary') or len(facts_payload)}, "
+        f"secondary={sum(1 for x in facts_payload if x.get('routing_group') == 'secondary')}, "
+        f"reserve={sum(1 for x in facts_payload if x.get('routing_group') == 'reserve')}"
+    )
 
     # =====================================================================
     # 5) Вызов LLM для «УСТАНОВИЛ» (P_UST_TOKENS_JSON)
+    #    — БЕЗ передачи статей, только факты + meta с участниками
     # =====================================================================
     system_prompt = prompts.P_UST_TOKENS_JSON
-    user_payload = {"facts": facts_payload}
+
+    user_payload = {
+        "facts": facts_payload,
+        "meta": case_meta,  # project_name, suspects, victims, organizations, platforms, суммы, participants_formatted
+        # ВАЖНО: НИКАКИХ primary_article / secondary_articles здесь нет.
+    }
+
     user_prompt = json.dumps(user_payload, ensure_ascii=False, indent=2)
 
     response = ask_llm(system_prompt, user_prompt)
@@ -393,7 +776,7 @@ def qualify_documents(
             raise ValueError("LLM returned error marker")
 
         parsed = safe_json_loads(response)
-        if not parsed:
+        if not parsed or not isinstance(parsed, dict):
             raise ValueError("JSON parse failed")
 
         ustanovil_text = (parsed.get("ustanovil") or "").strip()
@@ -425,11 +808,17 @@ def qualify_documents(
             for f in routed_facts:
                 used_tokens.extend(_extract_token_ids_from_fact(f))
 
+    # Очистка от технических вставок (token-id, UUID и т.п.)
+    ustanovil_text = _strip_technical_tokens(ustanovil_text)
+
     # ------------------------------------------------------------
-    # 6.1. Разбиение «УСТАНОВИЛ» на предложения (для логов)
+    # 6.1. Разбиение «УСТАНОВИЛ» на предложения и статистика
     # ------------------------------------------------------------
     _sentences_plain = split_into_sentences(ustanovil_text)
     logger.info(f"📘 USTANOVIL: разбиение на предложения = {len(_sentences_plain)}")
+
+    ustanovil_word_count = _count_words(ustanovil_text)
+    logger.info(f"📘 USTANOVIL: длина ~ {ustanovil_word_count} слов")
 
     # ------------------------------------------------------------
     # 6.2. Собираем все возможные token_id из фактов
@@ -453,7 +842,6 @@ def qualify_documents(
         all_token_ids=list(all_token_ids),
     )
 
-    # сливаем строгий alignment в основной
     if isinstance(base_alignment, dict):
         alignment = {**base_alignment, **strict_al}
     else:
@@ -461,18 +849,21 @@ def qualify_documents(
 
     # =====================================================================
     # 7) ПОСТАНОВИЛ — LLM (обычный режим, но JSON-вход)
+    #    — статьи УК/УПК ИИ выводит сам из ustanovil_text, мы НЕ подсказываем номера
     # =====================================================================
     post_system = prompts.P_POST
     post_payload = {
         "ustanovil_text": ustanovil_text,
-        "primary_article": primary_article,
-        "secondary_articles": secondary_articles,
+        "meta": case_meta,
+        # НЕТ primary_article/secondary_articles — ИИ сам решает, какие статьи указать.
     }
     post_user = json.dumps(post_payload, ensure_ascii=False, indent=2)
 
     post_text = ask_llm(post_system, post_user)
     if post_text.startswith("[LLM_ERROR]"):
         post_text = _fallback_postanovil(ustanovil_text)
+
+    post_text = _strip_technical_tokens(post_text)
 
     # =====================================================================
     # 8) Verification (token anti-hallucination + тексты + источники)
@@ -492,10 +883,11 @@ def qualify_documents(
     # 9) Формирование результата
     # =====================================================================
     result = {
-        # авто-классификация состава
+        # авто-классификация состава (отдельный слой)
         "auto_classification": classification,
         "primary_article": primary_article,
         "secondary_articles": secondary_articles,
+        "articles_all": articles_all,
 
         # метаданные генерации
         "generation_id": str(uuid.uuid4()),
@@ -505,15 +897,18 @@ def qualify_documents(
         # фактологическая база
         "facts_used": facts_payload,
         "used_tokens": used_tokens,
+        "case_meta": case_meta,
 
         # текст постановления
         "established_text": ustanovil_text.strip(),
         "final_postanovlenie": post_text.strip(),
 
+        # статистика по длине квалификации
+        "ustanovil_word_count": ustanovil_word_count,
+        "ustanovil_sentence_count": len(_sentences_plain),
+
         # проверка
         "verification": verification,
-
-        # предложение → токены
         "sentence_map": sentence_map,
         "sentence_alignment": alignment,
         "verification_sentences": verification.get("sentences"),
@@ -527,67 +922,128 @@ def qualify_documents(
     }
 
     logger.info(
-        f"✔ QUALIFIER 4.5 завершён: facts={len(facts_payload)}, used={len(used_tokens)}"
+        f"✔ QUALIFIER 6.0.2 завершён: facts={len(facts_payload)}, used={len(used_tokens)}, "
+        f"ustanovil_words={ustanovil_word_count}"
     )
     return result
 
 
 # ============================================================
-# 🔧 Fallback «УСТАНОВИЛ» (умный, без мусора)
+# 🔧 Fallback «УСТАНОВИЛ» (формат 2, без мотивов)
 # ============================================================
 
 def _fallback_ustanovil(facts: List[LegalFact]) -> str:
     """
     Умный fallback: строит краткую юридическую фабулу из фактов,
-    без токенов, без мусора, без source_refs.
-    Соответствует логике ст. 204 УПК РК (общая фабула).
+    без токенов, без source_refs, без мотивов и оценок.
+    Использует формат 2 для участников:
+    «лицо, указанное в материалах как ...» / «организация, фигурирующая как ...».
     """
 
-    persons = set()
+    meta = _collect_case_meta(facts)
+
+    suspects = meta.get("suspects") or []
+    victims = meta.get("victims") or []
+    organizations = meta.get("organizations") or []
+    platforms_named = meta.get("platforms") or []
+    project_name = meta.get("project_name")
+
+    persons_other = set()
     amounts = []
     actions = set()
     dates = set()
-    platforms = set()
+    platform_flags = set()
 
     for f in facts:
-        txt = (getattr(f, "text", "") or "").lower()
+        txt = (getattr(f, "text", "") or "")
+        low = txt.lower()
         tokens = getattr(f, "tokens", []) or []
 
         for t in tokens:
             if t.type == "person" and t.value:
                 v = t.value.strip()
                 if len(v) > 2 and v.lower() not in _BAD_PERSON_TOKENS:
-                    persons.add(v)
+                    norm = _normalize_person_name(v)
+                    if norm and norm not in suspects and norm not in victims:
+                        persons_other.add(norm)
 
-            if t.type == "amount":
+            if t.type == "amount" and t.value:
                 amounts.append(t.value)
 
-            if t.type == "date":
+            if t.type == "date" and t.value:
                 dates.add(t.value)
 
-        if any(w in txt for w in ["перевел", "перевела", "отправил", "отправила", "внес", "внесла", "пополнил", "пополнила"]):
-            actions.add("переводы денежных средств")
+        if any(
+            w in low
+            for w in [
+                "перевел",
+                "перевела",
+                "отправил",
+                "отправила",
+                "внес",
+                "внесла",
+                "пополнил",
+                "пополнила",
+            ]
+        ):
+            actions.add("переводами и иными операциями с денежными средствами")
 
-        if any(w in txt for w in ["обман", "обманным путем", "ввел в заблуждение", "ввела в заблуждение", "ввели в заблуждение"]):
-            actions.add("введение потерпевших в заблуждение")
-
-        if "usdt" in txt or "okx" in txt or "binance" in txt:
-            platforms.add("криптовалютные операции")
+        if "usdt" in low or "okx" in low or "binance" in low:
+            platform_flags.add("операциями, связанными с цифровыми сервисами и криптовалютными платформами")
 
     lines: List[str] = []
-    lines.append("По материалам дела установлено следующее.")
+    lines.append("По материалам досудебного расследования установлено следующее.")
 
-    if actions:
-        lines.append(f"Зафиксированы действия, связанные с {', '.join(sorted(actions))}.")
+    # Организация / проект
+    org_source_names: List[str] = []
+    if project_name:
+        org_source_names.append(project_name)
+    if organizations:
+        for o in organizations:
+            if o not in org_source_names:
+                org_source_names.append(o)
 
-    if persons:
+    if org_source_names:
+        main_org = org_source_names[0]
         lines.append(
-            f"В деле фигурируют следующие участники: {', '.join(sorted(persons))}."
+            f"В материалах фигурирует организация (проект), обозначенная в документах как «{main_org}»."
         )
 
+    # Подозреваемые
+    if suspects:
+        formatted = ", ".join(
+            f"лицо, указанное в материалах как {s}" for s in sorted(suspects)
+        )
+        lines.append(
+            f"В качестве подозреваемых в материалах указаны {formatted}."
+        )
+
+    # Потерпевшие
+    if victims:
+        formatted = ", ".join(
+            f"лицо, указанное в материалах как {v}" for v in sorted(victims)
+        )
+        lines.append(
+            f"В материалах отражены потерпевшие, указанные в материалах как {formatted}."
+        )
+
+    # Иные участники
+    if persons_other:
+        lines.append(
+            "Дополнительно в материалах упоминаются иные участники, обозначенные в документах как: "
+            + ", ".join(sorted(persons_other))
+            + "."
+        )
+
+    # Действия / операции
+    if actions:
+        lines.append(
+            f"Зафиксированы действия, связанные с {', '.join(sorted(actions))}."
+        )
+
+    # Суммы
     if amounts:
         try:
-            # грубая нормализация для min/max: убираем нецифровые
             normalized = []
             for a in amounts:
                 digits = re.sub(r"[^\d]", "", a)
@@ -597,22 +1053,41 @@ def _fallback_ustanovil(facts: List[LegalFact]) -> str:
                 min_v = min(normalized)
                 max_v = max(normalized)
                 lines.append(
-                    f"Отмечены операции на значительные суммы, ориентировочно от {min_v} до {max_v} тенге."
+                    f"Операции с денежными средствами отражены на суммы от {min_v} до {max_v} тенге."
                 )
         except Exception:
-            # если не смогли нормализовать — просто перечислим суммы
             lines.append(
-                f"Отмечены операции на следующие суммы: {', '.join(amounts)}."
+                "В материалах указаны операции с денежными средствами на следующие суммы: "
+                + ", ".join(amounts)
+                + "."
             )
 
-    if platforms:
-        lines.append("Имеются сведения об операциях, связанных с криптовалютными платформами.")
+    # Платформы по токенам (именованные)
+    if platforms_named:
+        lines.append(
+            "В материалах упомянуты платформы и цифровые сервисы, обозначенные в документах как: "
+            + ", ".join(f"«{p}»" for p in sorted(platforms_named))
+            + "."
+        )
 
+    # Платформы по текстовым признакам
+    if platform_flags:
+        lines.append(
+            "Отмечены также сведения об операциях, связанных с цифровыми сервисами и криптовалютными платформами."
+        )
+
+    # Даты
     if dates:
-        lines.append(f"События относятся к датам: {', '.join(sorted(dates))}.")
+        lines.append(
+            "События, изложенные в материалах, соотносятся со следующими датами: "
+            + ", ".join(sorted(dates))
+            + "."
+        )
 
+    # Финальное обобщение без мотивов/выводов
     lines.append(
-        "Указанные обстоятельства в совокупности свидетельствуют о совершении действий имущественного характера с использованием введения в заблуждение и привлечения денежных средств потерпевших."
+        "Перечисленные сведения в совокупности характеризуют фактические обстоятельства, "
+        "отражённые в материалах досудебного расследования, без оценки их юридической квалификации."
     )
 
     return " ".join(lines).strip()
@@ -621,8 +1096,8 @@ def _fallback_ustanovil(facts: List[LegalFact]) -> str:
 def _fallback_postanovil(ustanovil_text: str) -> str:
     return (
         "ПОСТАНОВИЛ:\n"
-        "На основании изложенного в разделе «УСТАНОВИЛ»,\n"
-        "требуется получение дополнительных данных для окончательной квалификации.\n"
+        "На основании изложенного в разделе «УСТАНОВИЛ» требуется получение дополнительных данных "
+        "для окончательной правовой оценки деяния.\n"
     )
 
 
@@ -630,7 +1105,7 @@ def _fallback_postanovil(ustanovil_text: str) -> str:
 # 🔧 Пустой результат
 # ============================================================
 
-def _empty_result(case_id: str, msg: str, fio: str, line: str) -> Dict[str, Any]:
+def _empty_result(case_id: Optional[str], msg: str, fio: str, line: str) -> Dict[str, Any]:
     return {
         "generation_id": None,
         "model_version": MODEL_VERSION,
@@ -639,10 +1114,13 @@ def _empty_result(case_id: str, msg: str, fio: str, line: str) -> Dict[str, Any]
         "final_postanovlenie": msg,
         "facts_used": [],
         "used_tokens": [],
+        "case_meta": {},
         "verification": {"error": msg, "overall_ok": False},
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "investigator_fio": fio,
         "investigator_line": line,
         "city": None,
         "date": None,
+        "ustanovil_word_count": 0,
+        "ustanovil_sentence_count": 0,
     }

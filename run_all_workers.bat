@@ -2,27 +2,32 @@
 title AFM Legal AI - Celery Workers
 
 echo ==========================================
-echo   STARTING ALL CELERY WORKERS
+echo   STARTING CELERY WORKERS
 echo ==========================================
 
-REM Запуск ingest worker 1
-start "ingest1" cmd /k ^
-celery -A app.worker.celery_app worker -Q default -n ingest1 --loglevel=INFO -P solo
+REM ------------------------------------------
+REM WORKER 1 — INGEST (upload, OCR start, chunker)
+REM ------------------------------------------
+start "ingest" cmd /k ^
+celery -A app.worker.celery_app worker -Q ingest -n worker_ingest --loglevel=INFO -P solo
 
-REM Запуск ingest worker 2
-start "ingest2" cmd /k ^
-celery -A app.worker.celery_app worker -Q default -n ingest2 --loglevel=INFO -P solo
+REM ------------------------------------------
+REM WORKER 2 — OCR (tesseract, clean text)
+REM ------------------------------------------
+start "ocr" cmd /k ^
+celery -A app.worker.celery_app worker -Q ocr -n worker_ocr --loglevel=INFO -P solo
 
-REM Запуск embeddings worker
-start "embeddings" cmd /k ^
-celery -A app.worker.celery_app worker -Q embeddings -n embed1 --loglevel=INFO -P solo
-
-REM Запуск vectors worker
+REM ------------------------------------------
+REM WORKER 3 — VECTORS (Weaviate embeddings)
+REM ------------------------------------------
 start "vectors" cmd /k ^
-celery -A app.worker.celery_app worker -Q vectors -n vectors1 --loglevel=INFO -P solo
+celery -A app.worker.celery_app worker -Q vectors -n worker_vectors --loglevel=INFO -P solo
 
 echo ==========================================
-echo   ALL CELERY WORKERS STARTED
+echo   CELERY WORKERS STARTED SUCCESSFULLY
+echo   - ingest queue
+echo   - ocr queue
+echo   - vectors queue
 echo ==========================================
 
 pause

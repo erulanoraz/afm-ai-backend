@@ -1,6 +1,6 @@
-# app/api/v1/qualifier.py
 import io
 import logging
+import re
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Body, HTTPException
@@ -18,133 +18,130 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["AI Qualifier"])
 
 
-# -----------------------------
-# 📥 Модель запроса
-# -----------------------------
+# ============================================================
+# 📥 Модель запроса (case_id УДАЛЁН)
+# ============================================================
 class QualifyRequest(BaseModel):
-    """Минимальная модель запроса для ИИ-квалификатора"""
-    case_id: str = Field(..., min_length=1)
-    as_pdf: bool = Field(default=False)   # <-- теперь False
+    as_pdf: bool = Field(default=False)
 
     class Config:
         json_schema_extra = {
             "example": {
-                "case_id": "255500121000018",
-                "as_pdf": False,         # <-- пример тоже False
+                "as_pdf": False
             }
         }
 
 
+# ============================================================
+# 🔍 Автоматическое извлечение case_id из текста документов
+# ============================================================
+CASE_ID_REGEX = r"(\d{15})"
+
+def extract_case_id_from_docs(docs):
+    """
+    Просматривает ВСЕ чанки и ищет номер ЕРДР.
+    Возвращает строку из 15 цифр или "".
+    """
+    for d in docs:
+        text = d.get("text") or ""
+        m = re.search(CASE_ID_REGEX, text)
+        if m:
+            return m.group(1)
+    return ""
+
 
 # ============================================================
-# 🔥 Основной endpoint квалификации
+# 🔥 ENDPOINT квалификации
 # ============================================================
 @router.post(
     "/qualify",
-    summary="Формирует постановление о квалификации деяния подозреваемого",
-    responses={
-        200: {
-            "description": "Постановление успешно сформировано",
-            "content": {
-                "application/pdf": {},
-                "text/plain": {},
-            },
-        },
-        404: {"description": "Документы для дела не найдены"},
-        500: {"description": "Ошибка при формировании постановления"},
-    },
+    summary="Формирует постановление о квалификации деяния подозреваемого"
 )
 def qualify_final_document(
     request: QualifyRequest = Body(...),
     db: Session = Depends(get_db),
 ):
     start_time = datetime.now()
-    logger.info(f"▶️ Начало квалификации дела {request.case_id}")
+    logger.info("▶️ Начало квалификации (GLOBAL MODE — без case_id фильтра)")
 
     try:
         # ------------------------------------------------------------
-        # 1️⃣ Retrieval — забираем документы из БД
-        #    ВАЖНО: здесь уже применены Chunker + OCR + Reranker
+        # 1) Retrieval GLOBAL — читаем ВСЕ файлы
         # ------------------------------------------------------------
-        logger.info(f"Загрузка документов для дела {request.case_id}")
         try:
-            docs = get_file_docs_for_qualifier(db, case_id=request.case_id)
+            docs = get_file_docs_for_qualifier(db)
         except Exception as e:
-            logger.error(f"Ошибка загрузки документов: {e}", exc_info=True)
             raise HTTPException(
                 status_code=500,
-                detail=f"Ошибка загрузки документов: {str(e)}",
+                detail=f"Ошибка Retrieval: {str(e)}"
             )
 
         if not docs:
             raise HTTPException(
                 status_code=404,
-                detail=f"Документы для дела {request.case_id} не найдены.",
+                detail="Документы не найдены."
             )
 
-        logger.info(f"Загружено документов для квалификации: {len(docs)}")
+        logger.info(f"📄 Документов для квалификации: {len(docs)}")
 
         # ------------------------------------------------------------
-        # 2️⃣ Запуск AI Qualifier 4.4 (ChatGPT-style RAG)
+        # 2) Авто-извлечение case_id из всех текстов
         # ------------------------------------------------------------
-        logger.info("🚀 Запуск AI Qualifier 4.4 (token-json)...")
+        resolved_case_id = extract_case_id_from_docs(docs)
+        if resolved_case_id:
+            logger.info(f"🔎 Авто case_id найден: {resolved_case_id}")
+        else:
+            logger.warning("⚠️ case_id не найден в документах")
+            resolved_case_id = ""   # пустой, но постановление все равно создадим
 
+        # ------------------------------------------------------------
+        # 3) Запуск AI Qualifier
+        # ------------------------------------------------------------
         try:
             result = qualify_documents(
-                case_id=request.case_id,
+                case_id=resolved_case_id,
                 docs=docs,
-                city="г. Павлодар",
+                city="",
                 date_str=datetime.now().strftime("%d.%m.%Y"),
                 investigator_line="Следователь по особо важным делам",
                 investigator_fio="",
             )
-        except HTTPException:
-            raise
         except Exception as e:
-            logger.error(f"Ошибка в qualify_documents: {e}", exc_info=True)
             raise HTTPException(
                 status_code=500,
-                detail=f"Ошибка анализа документов: {str(e)}",
+                detail=f"Ошибка AI Qualifier: {str(e)}"
+            )
+
+        post_body = (result.get("final_postanovlenie") or "").strip()
+        if not post_body:
+            raise HTTPException(
+                status_code=500,
+                detail="Квалификация не удалась: пустой текст."
             )
 
         # ------------------------------------------------------------
-        # 3️⃣ Проверка результата
-        # ------------------------------------------------------------
-        postanovlenie_body = (result.get("final_postanovlenie") or "").strip()
-
-        if not postanovlenie_body:
-            logger.error("Квалификация не удалась: текст постановления пустой")
-            raise HTTPException(
-                status_code=500,
-                detail="Квалификация не удалась: текст постановления пустой.",
-            )
-
-        # ------------------------------------------------------------
-        # 4️⃣ Формирование финального текста
+        # 4) Генерация финального текста
         # ------------------------------------------------------------
         final_text = _build_final_document(
-            case_id=request.case_id,
+            case_id=resolved_case_id,
             date_str=datetime.now().strftime("%d.%m.%Y"),
-            postanovlenie_body=postanovlenie_body,
+            postanovlenie_body=post_body,
             result=result,
         )
 
         duration = (datetime.now() - start_time).total_seconds()
-        logger.info(
-            f"✔ Квалификация по делу {request.case_id} завершена за {duration:.1f} сек."
-        )
+        logger.info(f"✔ Квалификация завершена за {duration:.1f} сек.")
 
         # ------------------------------------------------------------
-        # 5️⃣ Возврат PDF или текста
+        # 5) PDF или текст
         # ------------------------------------------------------------
         if request.as_pdf:
             try:
                 pdf_bytes = generate_postanovlenie_pdf(final_text)
             except Exception as e:
-                logger.error(f"Ошибка PDF генерации: {e}", exc_info=True)
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Ошибка при создании PDF: {str(e)}",
+                    detail=f"Ошибка PDF генерации: {str(e)}"
                 )
 
             return StreamingResponse(
@@ -152,56 +149,24 @@ def qualify_final_document(
                 media_type="application/pdf",
                 headers={
                     "Content-Disposition": (
-                        f"attachment; filename=postanovlenie_{request.case_id}.pdf"
+                        f"attachment; filename=postanovlenie_{resolved_case_id or 'unknown'}.pdf"
                     )
                 },
             )
 
-        # если as_pdf = False → просто возвращаем текст
-        return PlainTextResponse(
-            final_text,
-            media_type="text/plain; charset=utf-8",
-        )
+        return PlainTextResponse(final_text, media_type="text/plain; charset=utf-8")
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Неожиданная ошибка квалификации: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Внутренняя ошибка сервера: {str(e)}",
+            detail=f"Внутренняя ошибка: {str(e)}"
         )
 
 
 # ============================================================
-# 🔍 Проверка статуса дела
-# ============================================================
-@router.get(
-    "/qualify/status/{case_id}",
-    summary="Проверяет наличие документов для анализа",
-    response_model=dict,
-)
-def check_qualification_status(
-    case_id: str,
-    db: Session = Depends(get_db),
-):
-    try:
-        docs = get_file_docs_for_qualifier(db, case_id=case_id)
-        return {
-            "case_id": case_id,
-            "ready": len(docs) > 0,
-            "documents_count": len(docs),
-        }
-    except Exception as e:
-        logger.error(f"Ошибка проверки статуса: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ошибка проверки статуса: {str(e)}",
-        )
-
-
-# ============================================================
-# 🧱 Формирование финального документа
+# 🧱 Формирование финального текста
 # ============================================================
 def _build_final_document(
     case_id: str,
@@ -209,27 +174,24 @@ def _build_final_document(
     postanovlenie_body: str,
     result: dict,
 ) -> str:
-    # красивая русская дата
+
+    # русская дата
     try:
         dt = datetime.strptime(date_str, "%d.%m.%Y")
         months = [
-            "января",
-            "февраля",
-            "марта",
-            "апреля",
-            "мая",
-            "июня",
-            "июля",
-            "августа",
-            "сентября",
-            "октября",
-            "ноября",
-            "декабря",
+            "января", "февраля", "марта", "апреля", "мая", "июня",
+            "июля", "августа", "сентября", "октября", "ноября", "декабря"
         ]
         rus_date = f"{dt.day} {months[dt.month - 1]} {dt.year} года"
     except Exception:
         rus_date = date_str
 
+    # город
+    city = (result.get("city") or "").strip()
+    if city and not city.lower().startswith("г."):
+        city = f"г. {city}"
+
+    # поля из AI
     generation_id = result.get("generation_id")
     model_version = result.get("model_version")
     timestamp = result.get("timestamp")
@@ -237,10 +199,9 @@ def _build_final_document(
     investigator_line = result.get("investigator_line") or "Следователь"
     investigator_fio = result.get("investigator_fio") or ""
 
-    # 🔹 НОВОЕ: берём текст «УСТАНОВИЛ» из результата Qualifier
     ustanovil_body = (result.get("established_text") or "").strip()
 
-    # Если по какой-то причине пусто — не ломаемся, просто выводим только ПОСТАНОВИЛ
+    # составление тела
     if ustanovil_body:
         body_block = f"""УСТАНОВИЛ:
 {ustanovil_body}
@@ -248,13 +209,15 @@ def _build_final_document(
 ПОСТАНОВИЛ:
 {postanovlenie_body}"""
     else:
-        body_block = f"""ПОСТАНОВИЛ:
-{postanovlenie_body}"""
+        body_block = f"ПОСТАНОВИЛ:\n{postanovlenie_body}"
+
+    # если case_id найден — пишем его заголовке
+    case_line = f"по делу № {case_id}" if case_id else ""
 
     return f"""ПОСТАНОВЛЕНИЕ
-о квалификации деяния подозреваемого
+о квалификации деяния подозреваемого {case_line}
 
-г. Павлодар, {rus_date}
+{city}, {rus_date}
 
 {body_block}
 

@@ -1,3 +1,4 @@
+# app/services/rag_router.py
 from __future__ import annotations
 from typing import List, Optional
 from app.services.facts.fact_models import LegalFact
@@ -5,40 +6,56 @@ from app.services.facts.fact_models import LegalFact
 
 class RAGRouter:
     """
-    RAG Router 6.3 — Anti-Garbage Investigator Edition
-    Пропускает ТОЛЬКО реальные криминальные факты.
+    RAGRouter v9.0 — Full Criminal Context Routing Engine
+
+    Главные улучшения:
+    • удерживает максимум криминального материала (деньги, переводы, крипта, проект, схема)
+    • роль + токены + confidence → сильная приоритезация
+    • мягкое исключение мусора, НО не режет полезные факты
+    • специальный режим для статей 190/217 (мошенничество / финансовая пирамида)
     """
 
-    MAX_PRIMARY = 60
-    MAX_SECONDARY = 40
-    MAX_RESERVE = 10
-    MAX_TOTAL = 110
+    # Ограничения итогового объёма для LLM
+    MAX_TOTAL = 240
+    MAX_PRIMARY = 130
+    MAX_SECONDARY = 80
+    MAX_RESERVE = 30
 
-    CONF_STRONG = 0.35
-    CONF_WEAK = 0.15
+    # Пороги уверенности
+    CONF_STRONG = 0.30
+    CONF_WEAK = 0.12
 
-    # ---------------------------------------------------------------
-    # РАЗРЕШЁННЫЕ РОЛИ (только реальные криминальные)
-    # ---------------------------------------------------------------
-    ALLOWED_ROLES = {
+    # Разрешённые (ядерные) роли
+    ALLOWED = {
+        "suspect_action",
         "fraud_action",
         "fraud_event",
-        "suspect_action",
-        "victim_loss",
-        "money_transfer",
+
         "investment_event",
         "investment_context",
-        "crypto_operation",
-        "economic_action",
-        "digital_transfer",
-        "admin_action",
+
         "scheme_marker",
-        "deception_context",
+        "entity_reference",
+
+        "crypto_operation",
+        "digital_transfer",
+        "economic_action",
+
+        "victim_loss",
+        "money_transfer",
+
+        "admin_action",
     }
 
-    # запрещаем generic/role_statement
-    BLOCKED_ROLES = {"generic_fact", "role_statement", "amount_related"}
+    # Роли, почти всегда бесполезные
+    BLOCKED = {
+        "generic_fact",
+        "role_statement",
+        "victim_statement",
+        "address_only",
+    }
 
+    # Нормализация входящих ролей
     NORMALIZE = {
         "fraud_flag": "fraud_event",
         "invest_flag": "investment_event",
@@ -46,75 +63,162 @@ class RAGRouter:
         "role_organizer": "suspect_action",
         "role_victim": "victim_loss",
         "role_witness": "role_statement",
-        "action": "economic_action",
-        "channel": "digital_transfer",
-        "account": "digital_transfer",
+
+        "entity": "entity_reference",
+        "project": "entity_reference",
+        "platform": "entity_reference",
+        "organization": "entity_reference",
+
         "crypto": "crypto_operation",
+        "crypto_flag": "crypto_operation",
+
+        "account": "digital_transfer",
+        "channel": "digital_transfer",
+
         "scheme": "scheme_marker",
+        "scheme_flag": "scheme_marker",
+
+        "economic_flag": "economic_action",
+        "money": "money_transfer",
     }
 
+    # Приоритет ролей (меньше = важнее)
     ROLE_PRIORITY = {
-        "fraud_action": 1,
-        "fraud_event": 2,
-        "suspect_action": 3,
-        "scheme_marker": 3,
-        "investment_event": 4,
-        "investment_context": 4,
-        "admin_action": 4,
-        "crypto_operation": 5,
-        "money_transfer": 5,
-        "economic_action": 6,
-        "digital_transfer": 6,
-        "victim_loss": 7,
+        "suspect_action": 1,
+        "fraud_action": 2,
+        "fraud_event": 3,
+
+        "scheme_marker": 4,
+        "investment_event": 5,
+        "investment_context": 6,
+
+        "money_transfer": 7,
+        "crypto_operation": 7,
+        "economic_action": 8,
+        "digital_transfer": 8,
+
+        "victim_loss": 9,
+        "admin_action": 10,
+
+        "entity_reference": 11,
     }
 
-    # ---------------------------------------------------------------
-    # Главный метод
-    # ---------------------------------------------------------------
+    # Вес токенов для усиления приоритета
+    BOOST_TOKENS = {
+        "amount": 18,
+        "fraud_flag": 14,
+        "invest_flag": 12,
+        "scheme_flag": 12,
+        "crypto_flag": 12,
+        "crypto": 12,
+        "channel": 8,
+        "account": 8,
+        "economic_flag": 8,
+        "admin_flag": 6,
+        "entity": 10,
+        "project": 10,
+        "platform": 10,
+        "organization": 8,
+        "article_ref": 5,
+        "date": 3,
+    }
+
+    def _token_boost(self, f: LegalFact) -> int:
+        score = 0
+        for t in f.tokens or []:
+            score += self.BOOST_TOKENS.get(t.type, 0)
+        return score
+
+    # ======================================================================
+    # ГЛАВНАЯ ФУНКЦИЯ
+    # ======================================================================
     def route_for_qualifier(
-        self, facts: List[LegalFact], target_article: Optional[str] = None
+        self,
+        facts: List[LegalFact],
+        target_article: Optional[str] = None,
     ) -> List[LegalFact]:
 
         if not facts:
             return []
 
-        # нормализация ролей
+        # ------------------------------------------------------------
+        # 1. Нормализация ролей
+        # ------------------------------------------------------------
         for f in facts:
             if f.role in self.NORMALIZE:
                 f.role = self.NORMALIZE[f.role]
 
-        # убираем generic_fact, role_statement, amount_related
-        filtered = [
-            f for f in facts
-            if (f.role in self.ALLOWED_ROLES)
-        ]
+        # ------------------------------------------------------------
+        # 2. Drop BLOCKED роли (но мягко)
+        # ------------------------------------------------------------
+        filtered: List[LegalFact] = []
+
+        for f in facts:
+            role = f.role or ""
+
+            # мусор
+            if role in self.BLOCKED:
+                continue
+
+            # Если роль неизвестна, но есть токены денег / проекта / платформы / крипты
+            # → оставляем как полезный контекст (особенно под 190 / 217)
+            if role not in self.ALLOWED:
+                token_types = {t.type for t in f.tokens or []}
+                if token_types.intersection({"amount", "project", "platform", "crypto", "crypto_flag",
+                                             "channel", "account", "scheme_flag", "fraud_flag", "invest_flag"}):
+                    filtered.append(f)
+                    continue
+                if target_article in ("190", "217"):
+                    filtered.append(f)
+                continue
+
+            filtered.append(f)
 
         if not filtered:
             return []
 
-        # strong/weak
-        strong = []
-        weak = []
+        # ------------------------------------------------------------
+        # 3. Strong / Weak
+        # ------------------------------------------------------------
+        strong, weak = [], []
 
         for f in filtered:
-            if f.confidence >= self.CONF_STRONG:
+            conf = getattr(f, "confidence", 0.0) or 0.0
+            if conf >= self.CONF_STRONG:
                 strong.append(f)
-            elif f.confidence >= self.CONF_WEAK:
-                # слабые но криминальные
-                if f.role in ("fraud_event", "scheme_marker", "investment_event"):
-                    strong.append(f)
-                else:
-                    weak.append(f)
+            else:
+                weak.append(f)
 
-        # baseline: только криминальные
-        primary = sorted(
-            strong,
-            key=lambda f: self.ROLE_PRIORITY.get(f.role, 99)
-        )[:self.MAX_PRIMARY]
+        # ------------------------------------------------------------
+        # 4. PRIMARY — роль + токены + confidence
+        # ------------------------------------------------------------
+        def primary_score(f: LegalFact):
+            rp = self.ROLE_PRIORITY.get(f.role, 99)
+            tb = -self._token_boost(f)
+            cp = -(getattr(f, "confidence", 0.0) or 0.0) * 10
+            return (rp, tb, cp)
 
-        secondary = weak[:self.MAX_SECONDARY]
-        reserve = weak[self.MAX_SECONDARY:self.MAX_SECONDARY + self.MAX_RESERVE]
+        primary = sorted(strong, key=primary_score)[: self.MAX_PRIMARY]
 
+        # ------------------------------------------------------------
+        # 5. SECONDARY — полезный контекст
+        # ------------------------------------------------------------
+        def secondary_score(f: LegalFact):
+            return -self._token_boost(f)
+
+        secondary = sorted(weak, key=secondary_score)[: self.MAX_SECONDARY]
+
+        # ------------------------------------------------------------
+        # 6. RESERVE — запас ширины фабулы
+        # ------------------------------------------------------------
+        reserve = []
+        for f in weak[len(secondary):]:
+            if len(reserve) < self.MAX_RESERVE:
+                reserve.append(f)
+
+        # ------------------------------------------------------------
+        # 7. MERGE
+        # ------------------------------------------------------------
         result = primary + secondary + reserve
-        return result[:self.MAX_TOTAL]
 
+        return result[: self.MAX_TOTAL]

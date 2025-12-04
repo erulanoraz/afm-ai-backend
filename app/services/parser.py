@@ -1,7 +1,9 @@
+# app/services/parser.py
 from docx import Document
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 def extract_text_from_file(path: str) -> str:
     """
@@ -12,9 +14,9 @@ def extract_text_from_file(path: str) -> str:
     try:
         ext = path.lower().split(".")[-1]
 
-        # PDF → отдаём обработку OCR_worker
+        # PDF → отдаём обработку OCR_worker / chunker
         if ext == "pdf":
-            return ""  # сигнал для process_any_file: нужен OCR
+            return ""  # сигнал для process_any_file: нужен OCR/Smart-OCR
 
         # DOCX
         elif ext == "docx":
@@ -26,7 +28,8 @@ def extract_text_from_file(path: str) -> str:
             try:
                 with open(path, encoding="utf-8") as f:
                     return f.read().strip()
-            except:
+            except Exception:
+                # fallback под windows-1251
                 with open(path, encoding="cp1251", errors="ignore") as f:
                     return f.read().strip()
 
